@@ -1,0 +1,28 @@
+# Routine / administrative items to DROP or heavily DOWN-RANK before the agent
+# reads them. Matching is case-insensitive substring against the filing form/
+# item description or the news/wire headline.
+#
+# Rule of thumb: when unsure whether something is routine, KEEP it and let the
+# reasoning layer decide. Dropping a real catalyst is worse than a little noise.
+
+drop_or_downrank:
+  # Routine SEC housekeeping
+  - Reg FD boilerplate
+  - automatic grant
+  - tax withholding
+  - 10b5-1 plan adoption
+  - prospectus supplement (routine)
+  - effectiveness of registration
+  - notice of effectiveness
+  - certification of
+  - change of agent
+  # Routine corporate / IR noise often echoed by wires
+  - conference call schedule
+  - to present at
+  - webcast of
+  - to participate in
+  - investor conference
+  - dividend declaration (regular)
+  - annual meeting of stockholders
+  - record date for
+  - earnings date

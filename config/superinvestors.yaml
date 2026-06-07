@@ -1,0 +1,42 @@
+# Marquee funds / activist investors to FLAG (not endorse) when their name appears
+# as the filer on a 13D/13G or Form 4 (public record). Matching is case-insensitive
+# substring against the disclosed filer name. Edit freely.
+#
+# 13F-derived signals are quarterly/lagged (filed ~45 days after quarter-end), so
+# they are marked clearly as a SLOW signal — not a "last 24h" alert.
+
+rule: flag_any_disclosed_buy   # any 13D/13G/Form-4 match counts as significant for now
+
+# Also flagged in code (not listed here): any insider (Form 4) OPEN-MARKET BUY,
+# especially clusters, regardless of name.
+
+investors:
+  - Berkshire Hathaway          # Warren Buffett
+  - Pershing Square             # Bill Ackman
+  - Third Point                 # Dan Loeb
+  - Elliott Management          # Paul Singer (activist)
+  - Starboard Value             # (activist)
+  - ValueAct Capital
+  - Trian Partners              # Nelson Peltz
+  - Icahn Enterprises           # Carl Icahn
+  - Baupost Group               # Seth Klarman
+  - Greenlight Capital          # David Einhorn
+  - Appaloosa                   # David Tepper
+  - Scion Asset Management      # Michael Burry
+  - Tiger Global
+  - Duquesne Family Office      # Stanley Druckenmiller
+  - Himalaya Capital            # Li Lu
+
+  # Principal NAMES too — marquee investors often file personally (surname-first
+  # in EDGAR, e.g. "ICAHN CARL C", "ACKMAN WILLIAM A"), which the fund names above
+  # would miss. Only distinctive surnames (low false-positive risk).
+  - Icahn                       # Carl Icahn (personal + Icahn Capital)
+  - Buffett                     # Warren Buffett
+  - Ackman                      # Bill Ackman
+  - Burry                       # Michael Burry
+  - Einhorn                     # David Einhorn
+  - Loeb                        # Dan Loeb
+  - Peltz                       # Nelson Peltz
+  - Tepper                      # David Tepper
+  - Klarman                     # Seth Klarman
+  - Druckenmiller               # Stanley Druckenmiller

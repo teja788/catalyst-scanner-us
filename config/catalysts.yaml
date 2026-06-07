@@ -1,0 +1,117 @@
+# Catalyst taxonomy (US). Used by the pre-filter (M7) to TAG candidate catalyst
+# categories on filings/news/wires. Generous by design: a false tag is cheap, a
+# missed catalyst is not. The reasoning layer (CLAUDE.md) makes the final call.
+
+# --------------------------------------------------------------------------- #
+# 8-K Item codes -> catalyst categories. The Item number IS the signal in a US
+# current report. Parsed from the 8-K in M3; mapped to categories here.
+# --------------------------------------------------------------------------- #
+eightk_items:
+  "1.01": [contract, material_agreement]   # entry into a material definitive agreement
+  "1.02": [contract]                        # termination of a material agreement
+  "1.03": [distress]                        # bankruptcy / receivership
+  "2.01": [m_and_a]                         # completion of acquisition/disposition
+  "2.02": [earnings]                        # results of operations & financial condition
+  "2.03": [debt]                            # creation of a material direct financial obligation
+  "3.02": [capital_action]                  # unregistered sales of equity (dilution)
+  "5.01": [control_change]                  # changes in control of registrant
+  "5.02": [mgmt_change]                     # departure/appointment of directors or officers
+  "7.01": [reg_fd]                          # Regulation FD disclosure (often the PR)
+  "8.01": [other_material]                  # other events (frequently the big stuff)
+
+# --------------------------------------------------------------------------- #
+# Keyword rules (case-insensitive whole-token match against headline/body/wire).
+# --------------------------------------------------------------------------- #
+keywords:
+  capacity_capex:
+    - capacity expansion
+    - new facility
+    - new plant
+    - groundbreaking
+    - capex
+    - capital expenditure
+    - gigafactory
+    - ramp up
+    - ramp-up
+    - production capacity
+  contract_win:
+    - awarded
+    - contract award
+    - wins contract
+    - contract win
+    - purchase order
+    - letter of intent
+    - selected to provide
+    - definitive contract
+    - task order
+    - delivery order
+  m_and_a:
+    - to acquire
+    - acquires
+    - acquisition of
+    - definitive agreement
+    - merger agreement
+    - agreement to merge
+    - take private
+    - tender offer
+    - divestiture
+    - to be acquired
+  fda_clinical:                 # phase-2 (openFDA / ClinicalTrials) deepens this
+    - fda approval
+    - fda approves
+    - pdufa
+    - breakthrough therapy
+    - fast track
+    - orphan drug
+    - phase 3
+    - phase 2
+    - topline results
+    - clinical trial
+    - 510(k)
+    - de novo
+    - complete response letter
+  capital_action:
+    - share repurchase
+    - buyback
+    - stock buyback
+    - special dividend
+    - dividend increase
+    - spin-off
+    - spinoff
+    - at-the-market
+    - secondary offering
+    - public offering
+    - private placement
+    - convertible notes
+  guidance:
+    - raises guidance
+    - raised guidance
+    - lifts outlook
+    - record revenue
+    - record quarter
+    - beats estimates
+    - preliminary results
+    - guidance increase
+  index_inclusion:
+    - s&p 500
+    - nasdaq-100
+    - russell 1000
+    - index inclusion
+    - added to the
+    - join the index
+  mgmt_change:
+    - appointed ceo
+    - names ceo
+    - new chief executive
+    - new cfo
+    - appoints president
+    - steps down
+    - resignation of
+  activist_ownership:           # ownership ingester (M5) is the main source
+    - activist
+    - schedule 13d
+    - 13d filing
+    - takes stake
+    - builds stake
+    - nominates directors
+    - proxy contest

@@ -1,0 +1,49 @@
+# catalyst-scanner-us — global settings (edit me freely)
+# US sibling of the India "catalyst-scanner". All stored/displayed times are US/Eastern (ET).
+
+# ---- Universe: top-N US-listed common stocks by market cap ----
+universe:
+  include_exchanges: [nasdaq, nyse, amex]   # amex = NYSE American. Add/remove to widen/narrow.
+  top_n: 5000           # full coverage across the chosen exchanges.
+  include_adrs: true    # keep foreign ADRs/ADSs (treated as common-equity equivalents)
+  exclude_spacs: true   # drop SPAC / blank-check shells (name heuristic; refined live in M2)
+  # Security-name substrings that mark NON-common securities to DROP (case-insensitive).
+  # Dash-prefixed so they match Nasdaq Trader names ("Acme Corp - Warrants") without
+  # catching ordinary words ("United" won't match " - unit"). Verified live in M2.
+  drop_security_types:
+    - " - units"
+    - " - unit"
+    - " - warrant"
+    - " - warrants"
+    - " - rights"
+    - " - right"
+    - " - preferred"
+
+lookback_hours: 24          # DEFAULT rolling window; override per-run with --hours N / --days N.
+request_delay_sec: 0.13     # ~7-8 req/sec, under SEC's 10/sec cap (enforced per session)
+max_retries: 3
+timezone: America/New_York  # all stored/displayed times are ET (EDGAR + US markets run on ET)
+
+# ---- SEC EDGAR (fair-access is MANDATORY) ----
+edgar:
+  # SEC REQUIRES a User-Agent with a real name + contact email on EVERY request.
+  # A fake/missing UA risks temporary IP blocks.
+  user_agent: "Catalyst Scanner US iamteja1988@gmail.com"
+  rate_limit_per_sec: 8     # stay under the 10/sec cap
+
+# ---- News ----
+news:
+  finnhub_enabled: false    # optional; if true, reads FINNHUB_API_KEY from .env (M4/M12)
+
+output:
+  digest_dir: digests
+  context_pack: runtime/context_pack.md
+
+scoring:
+  mode: agent               # "agent" (live, default) | "llm_api" (future stub, scoring/llm_scorer.py)
+
+# Windows Task Scheduler (M11). Times are LOCAL machine time. Since you run on IST,
+# the evening catch-up after the US close (4:30pm ET) maps to ~02:00 IST next day.
+schedule:
+  refresh_every_min: 45
+  evening_catchup_local: "02:00"    # ~4:30pm ET previous day (US-close catch-up), in IST

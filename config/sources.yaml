@@ -1,0 +1,106 @@
+# SEC EDGAR endpoints + Nasdaq universe sources + news/wire RSS feeds.
+#
+# IMPORTANT: every news feed URL below is a CANDIDATE until VERIFIED LIVE in
+# Milestone 4 (fetched + confirmed valid, fresh XML). Any feed that does not
+# resolve will be commented out with a note (India-style). The EDGAR / Nasdaq
+# data endpoints are verified live in Milestones 2-3.
+
+# --------------------------------------------------------------------------- #
+# SEC EDGAR (official, free; requires the User-Agent header set in settings.yaml)
+# --------------------------------------------------------------------------- #
+edgar:
+  # Ticker -> CIK map (download once, query locally). The primary join source.
+  company_tickers:          https://www.sec.gov/files/company_tickers.json
+  # Same map but with exchange attached (Nasdaq/NYSE/etc.) — handy cross-check.
+  company_tickers_exchange: https://www.sec.gov/files/company_tickers_exchange.json
+  # Daily index of ALL filings: master.YYYYMMDD.idx (pipe-delimited) + index.json.
+  daily_index_base:         https://www.sec.gov/Archives/edgar/daily-index
+  # Quarterly full index (used for backfill / first run).
+  full_index_base:          https://www.sec.gov/Archives/edgar/full-index
+  # Near-real-time "Latest Filings" current feed (atom), filterable by form type.
+  current_feed:             https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent
+  # Per-company submissions API (targeted lookups for `ask`).
+  submissions_api:          https://data.sec.gov/submissions/CIK{cik}.json
+  # Document archive root: .../edgar/data/{CIK}/{accession-no-dashes}/{primary-doc}
+  archives_base:            https://www.sec.gov/Archives/edgar/data
+
+# --------------------------------------------------------------------------- #
+# Universe sources (top-N US by market cap)
+# --------------------------------------------------------------------------- #
+nasdaq_trader:
+  # Authoritative listed-symbol directories (pipe-delimited). Carry ETF + Test
+  # Issue flags we use to exclude non-common securities.
+  nasdaqlisted: https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt   # Nasdaq-listed
+  otherlisted:  https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt    # NYSE / NYSE American / Arca / etc.
+
+nasdaq_screener:
+  # Returns symbol + marketCap + sector + country. Needs browser-like headers
+  # (set in http.py). One bulk call per exchange. Primary market-cap source;
+  # yfinance is the per-symbol fallback if this bot-blocks (verified in M2).
+  stocks_api: https://api.nasdaq.com/api/screener/stocks?tableonly=true&download=true
+
+# --------------------------------------------------------------------------- #
+# News + press-release wires (company-tagged downstream). Trust tiers:
+#   wire = press-release wires (medium-high) ; news = financial outlets (lower)
+# --------------------------------------------------------------------------- #
+news_feeds:
+  # All feeds below were live-verified on 2026-06-06 (fetched, parsed, fresh
+  # entries with parseable dates). Dead/stale feeds are commented out at the
+  # bottom with the reason.
+
+  # ---- Press-release wires (medium-high trust; most hard catalysts land here) ----
+  - name: PR Newswire (All)
+    url: https://www.prnewswire.com/rss/news-releases-list.rss
+    trust: wire
+  - name: PR Newswire (Financial Services)
+    url: https://www.prnewswire.com/rss/financial-services-latest-news/financial-services-latest-news-list.rss
+    trust: wire
+  - name: GlobeNewswire (Public Companies)
+    url: https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire-Public-Companies
+    trust: wire
+
+  # ---- Financial news (lower trust, broad) ----
+  - name: CNBC (Markets)
+    url: https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069
+    trust: news
+  - name: CNBC (Top News)
+    url: https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114
+    trust: news
+  - name: CNBC (Business)
+    url: https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147
+    trust: news
+  - name: MarketWatch (Top Stories)
+    url: https://feeds.marketwatch.com/marketwatch/topstories/
+    trust: news
+  - name: MarketWatch (Bulletins)
+    url: https://feeds.marketwatch.com/marketwatch/bulletins/
+    trust: news
+  - name: Nasdaq (Markets)
+    url: https://www.nasdaq.com/feed/rssoutbound?category=Markets
+    trust: news
+  - name: Seeking Alpha (Market Currents)
+    url: https://seekingalpha.com/market_currents.xml
+    trust: news
+
+  # ---- Per-ticker template (NOT used in the broad refresh — reserved for `ask`,
+  #      which expands {TICKER} for ONE company on demand; looping it over the whole
+  #      universe would be 500-5000 fetches per run). ----
+  - name: Yahoo Finance (per-ticker)
+    url: https://feeds.finance.yahoo.com/rss/2.0/headline?s={TICKER}&region=US&lang=en-US
+    trust: news
+    per_ticker: true
+
+  # ---- DEAD / UNUSABLE (verified live 2026-06-06) — fix the URL or remove ----
+  # Business Wire: no working public RSS URL found (feed.businesswire.com needs an
+  #   opaque per-category rss id we couldn't obtain); returns an empty feed.
+  # ACCESSWIRE: https://www.accesswire.com/users/rss.aspx returned 0 entries.
+  # MarketWatch (RealTime): served STALE content (latest entry ~1 year old), like
+  #   India's Moneycontrol cache issue — useless for a recency scanner.
+
+# --------------------------------------------------------------------------- #
+# Optional free news API (off by default; key in .env). Reserved for market-news
+# + targeted `ask` pulls — NOT a per-ticker sweep over the whole universe.
+# --------------------------------------------------------------------------- #
+finnhub:
+  company_news: https://finnhub.io/api/v1/company-news     # ?symbol=&from=&to=&token=
+  market_news:  https://finnhub.io/api/v1/news             # ?category=general&token=

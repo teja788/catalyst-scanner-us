@@ -1,0 +1,10 @@
+# Streamlit config for the dashboard (read when run from this project folder).
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#22C55E"
+
+[server]
+headless = false

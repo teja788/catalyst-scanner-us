@@ -1,0 +1,17 @@
+# catalyst-scanner-us dependencies (lean by design). sqlite3 is stdlib.
+requests>=2.31
+feedparser>=6.0
+beautifulsoup4>=4.12
+lxml>=5.0
+PyYAML>=6.0
+python-dateutil>=2.8
+tzdata>=2024.1          # Windows has no IANA tz DB; zoneinfo needs this for America/New_York
+rich>=13.0
+typer>=0.12
+yfinance>=0.2.40        # free market-cap fallback (M2) + future price/quote adapter (M12)
+streamlit>=1.40         # web dashboard (dashboard.py)
+
+# Optional — only needed for the dashboard's AI rank/chat panels (lazy-imported,
+# never required by the core scanner). Install to enable Claude / OpenAI answers.
+anthropic>=0.40
+openai>=1.50
