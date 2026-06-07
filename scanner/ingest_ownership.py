@@ -195,6 +195,59 @@ def _parse_sc13(text: str) -> dict[str, Any]:
     return {"filer_name": filer or "", "filer_cik": filer_cik, "pct": pct}
 
 
+def _amendment_detail(full_txt: str, form: str) -> str:
+    """Best-effort 'what did this amendment do' — the Item 5(c) last-60-days
+    transaction clause + a coarse direction hint (ADDED / TRIMMED / NEW / technical).
+
+    Heuristic: the *snippet* is the reliable part (a verbatim quote from the filing);
+    the direction tag is a hint to confirm. This is the 'digging' that distinguishes a
+    fresh activist buy from a long-term holder's routine amendment (e.g. Ackman/QSR).
+    """
+    if form == "SCHEDULE 13G":
+        return "NEW 13G — passive >5% position"
+    # isolate the primary SC 13 document (skip exhibits), strip tags
+    body = full_txt
+    for d in full_txt.split("<DOCUMENT>"):
+        if re.search(r"<TYPE>\s*SC 13", d):
+            body = d
+            break
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body))
+
+    # 1) AFFIRMATIVE activist intent in Item 4 — high signal. Phrased to avoid the
+    #    boilerplate "may acquire / may propose a merger" laundry list every 13D has.
+    intents = [
+        (r"(?:delivered|submitted|made|sent)[^.]{0,80}(?:non-?binding\s+)?(?:proposal|offer|letter)[^.]{0,90}acquir", "BUYOUT PROPOSAL"),
+        (r"agreement and plan of merger|definitive merger agreement|enter(?:ed)?\s+into[^.]{0,40}merger\s+agreement", "MERGER AGREEMENT"),
+        (r"commenc\w*[^.]{0,30}tender offer|tender offer to purchase", "TENDER OFFER"),
+        (r"intend[s]?\s+to\s+nominate|has\s+nominated|deliver\w*[^.]{0,40}nominat", "BOARD NOMINEES"),
+    ]
+    for pat, tag in intents:
+        m = re.search(pat, text, re.I)
+        if m:
+            snip = re.sub(r"\s+", " ", text[max(0, m.start() - 60):m.start() + 260]).strip()
+            return f"[{tag}] …{snip}…"[:340]
+
+    # 2) else: new vs amendment + last-60-days transaction DIRECTION
+    m = re.search(r".{0,110}(?:60|sixty)\s+days.{0,200}", text, re.I)
+    clause = m.group(0).strip() if m else ""
+    cl = clause.lower()
+    priced = re.search(r"\$\s?\d[\d,]*(?:\.\d+)?\s*(?:per share|/\s?share|a share)", text, re.I)
+    if re.search(r"\b(purchased|acquired|bought)\b", cl) and not re.search(r"\b(sold|disposed of)\b", cl):
+        dirn = "ADDED"
+    elif re.search(r"\b(sold|disposed of)\b", cl):
+        dirn = "TRIMMED"
+    elif cl and re.search(r"\bno\b.{0,40}transaction", cl) and "except" not in cl:
+        dirn = "no recent txns (technical)"
+    elif "except" in cl:
+        dirn = "recent txns — see exhibits"
+    else:
+        dirn = "dig Item 5(c)"
+    if form == "SCHEDULE 13D":
+        return f"NEW 13D — initial >5% position ({dirn})"
+    price = f" · ${priced.group(0).lstrip('$')}" if priced else ""
+    return f"[{form} · {dirn}{price}] {clause[:160]}".strip()
+
+
 # --------------------------------------------------------------------------- #
 # Public entrypoint
 # --------------------------------------------------------------------------- #
@@ -250,7 +303,7 @@ def ingest(session: PoliteSession | None = None,
         is_13d = r["form"].startswith("SCHEDULE 13D")
         if r["form"].startswith("4"):
             p = _parse_form4(text)
-            rec = {**p, "form_type": r["form"], "is_insider": 1, "is_activist": 0}
+            rec = {**p, "form_type": r["form"], "is_insider": 1, "is_activist": 0, "detail": ""}
         else:  # SCHEDULE 13D / 13G
             p = _parse_sc13(text)
             # Self-filing (filer CIK == issuer CIK) is a treasury/subsidiary 13D, not
@@ -259,7 +312,8 @@ def ingest(session: PoliteSession | None = None,
             rec = {"filer_name": p["filer_name"], "relationship": "", "side": "STAKE",
                    "shares": None, "price": None, "pct": p["pct"], "is_buy": 0,
                    "form_type": r["form"], "is_insider": 0,
-                   "is_activist": 1 if (is_13d and not is_self) else 0}
+                   "is_activist": 1 if (is_13d and not is_self) else 0,
+                   "detail": _amendment_detail(text, r["form"])}  # <-- the 'digging'
         rec.update({
             "ticker": meta.get("ticker", ""),
             "cik": meta["cik"],
@@ -284,13 +338,13 @@ def ingest(session: PoliteSession | None = None,
             "filer_name": r["company"], "relationship": "", "form_type": "13F-HR",
             "side": "13F", "shares": None, "price": None, "pct": None, "is_buy": 0,
             "is_insider": 0, "is_activist": 0,
+            "detail": "quarterly 13F-HR (lagged) — portfolio holdings not parsed",
             "matched_investor": _match_investor(r["company"], watchlist),
             "filing_url": _index_url(r["cik"], r["accession"]),
             "filed_at": _acceptance_iso("", r["date"]),
             "accession": r["accession"],
             "dedupe_hash": _dedupe_hash(r["accession"]),
             "source": "SEC EDGAR",
-            "note": "quarterly 13F holdings (lagged); holdings->universe diff is phase-2",
         })
 
     buys = sum(1 for o in out if o.get("is_buy"))

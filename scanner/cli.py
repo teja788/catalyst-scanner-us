@@ -173,8 +173,8 @@ def _refresh_all(since_override: datetime | None = None,
 
     Each source is isolated so one failure still lets the others proceed.
     """
-    run = sources or {"edgar", "news", "ownership"}
-    from scanner import ingest_edgar, ingest_news, ingest_ownership, store
+    run = sources or {"edgar", "news", "ownership", "external"}
+    from scanner import ingest_edgar, ingest_external, ingest_news, ingest_ownership, store
     from scanner.http import PoliteSession
     from scanner.universe import load_map
 
@@ -207,12 +207,19 @@ def _refresh_all(since_override: datetime | None = None,
         items = ingest_ownership.ingest(session=session, since=since)
         return len(items), store.upsert_ownership(items)
 
+    def _external():
+        # Federal contracts / FDA-clinical / patents — slower-moving; pull last 30d, dedupe.
+        c = ingest_external.ingest(days=30)
+        return sum(c.get(k, 0) for k in ("contracts", "fda", "patents")), c.get("new", 0)
+
     if "edgar" in run:
         _do("edgar", _edgar)
     if "news" in run:
         _do("news", _news)
     if "ownership" in run:
         _do("ownership", _ownership)
+    if "external" in run:
+        _do("external", _external)
     return results
 
 

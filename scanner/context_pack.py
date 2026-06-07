@@ -35,6 +35,46 @@ MAX_FILINGS = 150          # cap the verbose filings list so the pack stays read
 # 8-K item codes that are concrete corporate events — always surfaced as PRIORITY.
 PRIORITY_8K_ITEMS = {"1.03": "bankruptcy/distress", "2.01": "M&A completed", "5.01": "control change"}
 
+# LUCRATIVE business-catalyst tags — the genuinely-asymmetric forward catalysts.
+# Deliberately EXCLUDES the broad 8-K-1.01 item tags (contract/material_agreement) and
+# capital_action, which are dominated by dilutive FINANCING (ATM/notes/securities
+# purchase). A 1.01 only enters this bucket if its BODY re-tags to one of these.
+CATALYST_TAGS = {"contract_win", "partnership", "capacity_capex",
+                 "fda_clinical", "guidance", "index_inclusion", "patent"}
+_CATALYST_KWS = ("agreement", "contract", "supply", "license", "partnership", "approval",
+                 "phase 3", "phase 2", "capacity", "patent", "guidance", "milestone",
+                 "expansion", "facility", "purchase order")
+
+# Forms / 8-K items that are executive-comp or governance — NOT business catalysts.
+# Excluded from the lucrative bucket even if their text mentions FDA/award/phase-3
+# (e.g. comp tied to an FDA-approval "performance condition", or an "equity award").
+_NONCATALYST_FORMS = {"DEF 14A", "DEFA14A", "DEFR14A", "PRE 14A", "PREC14A", "DEFM14A"}
+_COMP_GOV_ITEMS = {"5.02", "5.03", "5.07"}
+
+
+def _is_comp_or_proxy(f: dict[str, Any]) -> bool:
+    if (f.get("form_type") or "") in _NONCATALYST_FORMS:
+        return True
+    items = f.get("item_codes") or []
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except (ValueError, TypeError):
+            items = []
+    return bool(items) and set(items) <= _COMP_GOV_ITEMS
+
+
+def _catalyst_snippet(body: str) -> str:
+    """Show body text around the first catalyst keyword, skipping the 8-K boilerplate header."""
+    if not body:
+        return ""
+    low = body.lower()
+    for k in _CATALYST_KWS:
+        i = low.find(k)
+        if i > 140:   # past the cover-page boilerplate
+            return "…" + body[max(0, i - 110):i + 210].strip() + "…"
+    return _short(body, 240)
+
 
 def _tz() -> ZoneInfo:
     return ZoneInfo(load_settings().get("timezone", "America/New_York"))
@@ -117,12 +157,23 @@ def _build_priority(filings: list[dict[str, Any]], ownership: list[dict[str, Any
             [o for o in ownership if o.get("is_buy") and not o.get("matched_investor")],
             key=lambda o: (o.get("shares") or 0) * (o.get("price") or 0), reverse=True),
         "corporate_events": _corporate_events(filings),
+        # Business catalysts (contracts / capacity / FDA / partnerships / patents),
+        # revealed by reading the filing body — the broad asymmetric-opportunity feed.
+        "catalysts": [f for f in filings
+                      if (set(f.get("candidate_tags") or []) & CATALYST_TAGS)
+                      and not f.get("is_routine") and not _is_comp_or_proxy(f)],
     }
 
 
 def build_context_pack(summary: dict[str, Any] | None = None,
-                       since: datetime | None = None) -> dict[str, Any]:
-    """Assemble + write the context pack. Returns paths and headline stats."""
+                       since: datetime | None = None,
+                       enrich_bodies: bool = True) -> dict[str, Any]:
+    """Assemble + write the context pack. Returns paths and headline stats.
+
+    `enrich_bodies` reads the primary document of catalyst-tagged filings (cached)
+    so an 8-K "Material Agreement" reveals WHAT the contract is. Set False to use
+    only already-cached bodies (the dashboard does this to stay snappy).
+    """
     summary = summary or run_prefilter(since=since)
     cand = summary["candidates"]
     idx = {c["cik"]: c for c in load_map()}
@@ -132,6 +183,10 @@ def build_context_pack(summary: dict[str, Any] | None = None,
     # Order: substantive catalyst-tagged first, then by recency (stable sorts).
     filings.sort(key=lambda f: f.get("filed_at") or "", reverse=True)
     filings.sort(key=lambda f: 0 if (f.get("candidate_tags") and not f.get("is_routine")) else 1)
+
+    if enrich_bodies:
+        from scanner import filing_body
+        filing_body.enrich(filings, max_fetch=200)   # reads bodies + re-tags on them
 
     news = cand["news"]
     tagged_news = [n for n in news if n.get("company_ciks")]
@@ -149,6 +204,10 @@ def build_context_pack(summary: dict[str, Any] | None = None,
 
     # PRIORITY signals — surfaced at the top of the pack, window-size-independent.
     priority = _build_priority(filings, ownership)
+    # External catalyst feeds (federal contracts / FDA-clinical / patents), matched to universe.
+    from scanner import store as _store
+    _since_date = (summary.get("window_since") or "")[:10]
+    priority["external"] = _store.get_recent_external_catalysts(_since_date) if _since_date else []
 
     md = _render_md(summary, priority, filings, ownership, tagged_news, market_news, coverage, idx)
     pack_json = _render_json(summary, priority, filings, ownership, tagged_news, coverage, idx)
@@ -199,6 +258,8 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
         out.append(f"[SUPERINVESTOR: {o.get('matched_investor')}] "
                    f"{_label(o.get('cik',''), o.get('ticker',''), o.get('company',''), idx)} — "
                    f"{o.get('form_type','')} {_own_detail(o)} — {o.get('filer_name','')} ({_et_short(o.get('filed_at'))})")
+        if o.get("detail"):
+            out.append(f"  → {o['detail']}")
         if o.get("filing_url"):
             out.append(f"  Source: {o['filing_url']}")
     if priority.get("superinvestor_13f"):
@@ -209,6 +270,8 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
         out.append(f"[ACTIVIST {o.get('form_type','')}] "
                    f"{_label(o.get('cik',''), o.get('ticker',''), o.get('company',''), idx)} {_own_detail(o)} — "
                    f"{o.get('filer_name','')} ({_et_short(o.get('filed_at'))})")
+        if o.get("detail"):
+            out.append(f"  → {o['detail']}")
         if o.get("filing_url"):
             out.append(f"  Source: {o['filing_url']}")
     for o in buys[:25]:
@@ -222,6 +285,33 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
                    f"{f.get('form_type','')} ({_et_short(f.get('filed_at'))})")
         if f.get("filing_url"):
             out.append(f"  Source: {f['filing_url']}")
+    for f in priority.get("catalysts", [])[:30]:   # contracts / capacity / FDA / partnerships / patents
+        tags = [t for t in (f.get("candidate_tags") or []) if t in CATALYST_TAGS]
+        out.append(f"[CATALYST: {', '.join(tags)}] "
+                   f"{_label(f.get('cik',''), f.get('ticker',''), f.get('company',''), idx)} — "
+                   f"{f.get('form_type','')} ({_et_short(f.get('filed_at'))})")
+        snip = _catalyst_snippet(f.get("body_text") or "")
+        if snip:
+            out.append(f"  → {snip}")
+        if f.get("filing_url"):
+            out.append(f"  Source: {f['filing_url']}")
+    # External feeds (non-EDGAR): federal contracts, FDA/clinical, patents.
+    _ext = priority.get("external", [])
+    if _ext:
+        _bycat: dict[str, list] = {}
+        for e in _ext:
+            _bycat.setdefault(e.get("category", "other"), []).append(e)
+        _labels = {"contract": "FEDERAL CONTRACT", "fda": "FDA / CLINICAL", "patent": "PATENT"}
+        for cat in ("fda", "contract", "patent"):
+            for e in _bycat.get(cat, [])[:20]:
+                amt = f" ${e['amount']:,.0f}" if e.get("amount") else ""
+                out.append(f"[{_labels.get(cat, cat.upper())}: {e.get('source')}] "
+                           f"{_label(e.get('cik',''), e.get('ticker',''), e.get('company',''), idx)}{amt} — "
+                           f"{e.get('headline','')} ({(e.get('event_date') or '')[:10]})")
+                if e.get("detail"):
+                    out.append(f"  → {_short(e['detail'], 200)}")
+                if e.get("url"):
+                    out.append(f"  Source: {e['url']}")
     out.append("")
     out.append("> NOTE: a 13D/A shows the CURRENT %, not whether the investor ADDED or TRIMMED — "
                "verify direction in the filing. Treat 13D and 13D/A equally as activist signals.")
@@ -308,7 +398,8 @@ def _own_json(o: dict[str, Any], idx: dict[str, dict]) -> dict[str, Any]:
         "form_type": o.get("form_type"), "filer": o.get("filer_name"),
         "side": o.get("side"), "shares": o.get("shares"), "price": o.get("price"), "pct": o.get("pct"),
         "matched_investor": o.get("matched_investor"), "is_buy": bool(o.get("is_buy")),
-        "is_activist": bool(o.get("is_activist")), "filed_at": o.get("filed_at"), "source": o.get("filing_url"),
+        "is_activist": bool(o.get("is_activist")), "detail": o.get("detail"),
+        "filed_at": o.get("filed_at"), "source": o.get("filing_url"),
     }
 
 
@@ -332,6 +423,20 @@ def _render_json(summary, priority, filings, ownership, tagged_news, coverage, i
                 "form_type": f.get("form_type"), "events": hits,
                 "filed_at": f.get("filed_at"), "source": f.get("filing_url"),
             } for f, hits in priority["corporate_events"][:60]],
+            "catalysts": [{
+                "ticker": f.get("ticker"), "company": f.get("company"), "cik": f.get("cik"),
+                "market_cap": _co(f.get("cik", ""), idx).get("market_cap"),
+                "form_type": f.get("form_type"),
+                "tags": [t for t in (f.get("candidate_tags") or []) if t in CATALYST_TAGS],
+                "snippet": _catalyst_snippet(f.get("body_text") or ""),
+                "filed_at": f.get("filed_at"), "source": f.get("filing_url"),
+            } for f in priority["catalysts"][:60]],
+            "external": [{
+                "ticker": e.get("ticker"), "company": e.get("company"), "cik": e.get("cik"),
+                "source": e.get("source"), "category": e.get("category"),
+                "headline": e.get("headline"), "detail": e.get("detail"), "amount": e.get("amount"),
+                "event_date": e.get("event_date"), "source_url": e.get("url"),
+            } for e in priority.get("external", [])[:80]],
         },
         "sec_filings": [{
             "ticker": f.get("ticker"), "company": f.get("company"), "cik": f.get("cik"),

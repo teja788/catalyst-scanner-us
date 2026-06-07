@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS ownership (
     is_insider       INTEGER,
     is_buy           INTEGER,
     is_activist      INTEGER,
+    detail           TEXT,          -- "what the amendment did": direction + Item 4/5(c) snippet
     filing_url       TEXT,
     accession        TEXT,
     filed_at         TEXT,
@@ -125,11 +126,30 @@ CREATE TABLE IF NOT EXISTS filing_text (
     created_at  TEXT
 );
 
+-- Non-EDGAR catalyst feeds (M-feeds): federal contracts, FDA/clinical, patents —
+-- matched to a universe company by org name. Same dedupe discipline as the rest.
+CREATE TABLE IF NOT EXISTS external_catalysts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    cik          TEXT,
+    ticker       TEXT,
+    company      TEXT,
+    source       TEXT,          -- USAspending | openFDA | ClinicalTrials | PatentsView
+    category     TEXT,          -- contract | fda | patent
+    headline     TEXT,
+    detail       TEXT,
+    amount       REAL,          -- contract $ (nullable)
+    url          TEXT,
+    event_date   TEXT,
+    ingested_at  TEXT,
+    dedupe_hash  TEXT UNIQUE
+);
+
 CREATE INDEX IF NOT EXISTS idx_filings_cik  ON filings(cik);
 CREATE INDEX IF NOT EXISTS idx_filings_at   ON filings(filed_at);
 CREATE INDEX IF NOT EXISTS idx_news_pub     ON news(published_at);
 CREATE INDEX IF NOT EXISTS idx_own_cik      ON ownership(cik);
 CREATE INDEX IF NOT EXISTS idx_own_at       ON ownership(filed_at);
+CREATE INDEX IF NOT EXISTS idx_ext_date     ON external_catalysts(event_date);
 """
 
 
@@ -151,6 +171,11 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
     conn = conn or get_conn()
     try:
         conn.executescript(_SCHEMA)
+        # Lightweight migration for DBs created before `detail` existed.
+        try:
+            conn.execute("ALTER TABLE ownership ADD COLUMN detail TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
     finally:
         if own:
@@ -246,7 +271,7 @@ def upsert_ownership(items: list[dict[str, Any]], conn: sqlite3.Connection | Non
     try:
         cols = ["cik", "ticker", "company", "filer_name", "relationship", "form_type",
                 "side", "shares", "price", "pct", "matched_investor", "is_insider",
-                "is_buy", "is_activist", "filing_url", "accession", "filed_at",
+                "is_buy", "is_activist", "detail", "filing_url", "accession", "filed_at",
                 "ingested_at", "dedupe_hash"]
         prepared = []
         for it in items:
@@ -255,6 +280,18 @@ def upsert_ownership(items: list[dict[str, Any]], conn: sqlite3.Connection | Non
                 r[k] = int(bool(r.get(k)))
             prepared.append(r)
         return _insert_ignore(conn, "ownership", cols, prepared)
+    finally:
+        if own:
+            conn.close()
+
+
+def upsert_external_catalysts(items: list[dict[str, Any]], conn: sqlite3.Connection | None = None) -> int:
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        cols = ["cik", "ticker", "company", "source", "category", "headline", "detail",
+                "amount", "url", "event_date", "ingested_at", "dedupe_hash"]
+        return _insert_ignore(conn, "external_catalysts", cols, list(items))
     finally:
         if own:
             conn.close()
@@ -365,6 +402,16 @@ def get_recent_ownership(since_iso: str, conn: sqlite3.Connection | None = None)
     conn = conn or get_conn()
     try:
         return _rows(conn, "SELECT * FROM ownership WHERE filed_at >= ? ORDER BY filed_at DESC", (since_iso,))
+    finally:
+        if own:
+            conn.close()
+
+
+def get_recent_external_catalysts(since_iso: str, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        return _rows(conn, "SELECT * FROM external_catalysts WHERE event_date >= ? ORDER BY event_date DESC", (since_iso,))
     finally:
         if own:
             conn.close()

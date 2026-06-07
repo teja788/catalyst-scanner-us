@@ -34,15 +34,16 @@ keywords:
     - ramp up
     - ramp-up
     - production capacity
-  contract_win:
-    - awarded
+  contract_win:                 # commercial wins (NOT exec-comp "equity award" boilerplate)
     - contract award
+    - awarded a contract
+    - awarded the contract
     - wins contract
+    - won a contract
     - contract win
+    - new contract
     - purchase order
-    - letter of intent
     - selected to provide
-    - definitive contract
     - task order
     - delivery order
   m_and_a:
@@ -115,3 +116,23 @@ keywords:
     - builds stake
     - nominates directors
     - proxy contest
+  partnership:                  # lucrative COMMERCIAL deals (revealed in 8-K 1.01 bodies / wires)
+    - strategic partnership
+    - collaboration agreement
+    - supply agreement
+    - off-take agreement
+    - offtake agreement
+    - licensing agreement
+    - license agreement
+    - joint venture
+    - multi-year agreement
+    - exclusive distribution
+    - manufacturing agreement
+  patent:                       # IP-moat / innovation signal (PatentsView feed deepens it)
+    - patent grant
+    - granted a patent
+    - granted patent
+    - patent award
+    - notice of allowance
+    - patent approval
+    - newly issued patent

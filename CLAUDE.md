@@ -40,13 +40,27 @@ separation and never blur it.
 
 **Always start with the `⚡ PRIORITY SIGNALS` section at the top of the pack.** It
 deterministically surfaces the highest-signal items — superinvestor/watchlist hits,
-activist stakes, insider buys, and completed M&A / distress / control-change 8-Ks —
-and is **never truncated** (the verbose SEC FILINGS list below it is capped for
-readability). This guarantees the top signals are never lost in a large window.
+activist stakes, insider buys, completed M&A / distress / control-change 8-Ks,
+**business CATALYSTS read from filing bodies** (lucrative contracts, capacity
+expansions, FDA/clinical, partnerships, patents — financing/comp filtered out), and
+**EXTERNAL feeds** (federal contract awards via USAspending, FDA drug approvals +
+ClinicalTrials Phase-3 readouts, USPTO patents) — and is **never truncated** (the
+verbose SEC FILINGS list below it is capped for readability). This guarantees the top
+signals are never lost in a large window.
+
+> The tool's purpose is BROAD asymmetric opportunities — not just ownership. Weight the
+> CATALYSTS / FDA / CONTRACTS signals as highly as activist/insider ones: a Phase-3
+> readout, a needle-moving federal contract, or a new lucrative supply deal is exactly
+> the forward catalyst the rubric wants. The `→` line gives the specifics; judge
+> materiality-to-size and the mechanism as usual.
 - Treat **SCHEDULE 13D and 13D/A equally** — amendments are where activists *escalate*
   (e.g. GameStop→eBay, Pershing Square→QSR). Do NOT filter to "new 13D only".
-- A **13D/A shows the CURRENT %**, not whether the investor ADDED or TRIMMED — say so
-  and verify direction in the filing (a stake below 5% on a 13D/A often means an exit).
+- A **13D/A shows the CURRENT %**, not whether the investor ADDED or TRIMMED. Each
+  ownership row now carries a **`detail`** field (the `→` line in the pack) with a
+  direction hint (NEW / ADDED / TRIMMED / technical) + a verbatim Item 5(c) snippet —
+  read it. For a borderline call, open the filing. A stake below 5% on a 13D/A often
+  means an exit; a long-term holder's routine amendment (e.g. Ackman/QSR, held since
+  2014) is NOT a new catalyst even though it surfaces as an activist signal.
 - Never hand-roll a narrower query than the pack itself; if you must query the DB
   directly, include amendments and the superinvestor slice.
 
@@ -104,6 +118,11 @@ offerings; self-filings; anything whose materiality can't be established from th
    - **Source:** [SEC filing / outlet](link)
 ```
 
+For an **ownership** lead, lead "What happened" with the **direction/intent** from the
+pack's `→ detail` line — NEW / ADDED / TRIMMED / BUYOUT / MERGER / BOARD-nominees —
+and NEVER imply a fresh stake for a long-held holder's routine amendment (e.g.
+Ackman/QSR). Always use this per-lead bullet structure — not tables.
+
 Then:
 - A short **"Watch, not act"** section for weaker / ambiguous items (terser).
 - If the day is quiet, a single line: **"Nothing notable."**
@@ -123,9 +142,12 @@ and offer to fetch it — never fabricate.
 
 Deterministic Python does plumbing only: `ingest_edgar` (daily-index + 8-K items) /
 `ingest_news` (wires + RSS, company-tagged) / `ingest_ownership` (13D/13G/Form 4,
-superinvestor-matched) → `store` (SQLite, dedupe, catch-up) → `prefilter` (drop noise,
-tag catalysts) → `context_pack` (the small packet you read). The agent does all the
-judgement. `scoring/llm_scorer.py` is OFF by default (no API key needed).
+superinvestor-matched) / `ingest_external` (USAspending contracts + openFDA/ClinicalTrials
+readouts + PatentsView, universe name-matched) → `store` (SQLite, dedupe, catch-up) →
+`prefilter` (drop noise, tag catalysts) → `filing_body` (reads catalyst 8-K bodies + re-tags,
+so a "material agreement" reveals the actual deal) → `context_pack` (the small packet you
+read). The agent does all the judgement. `scoring/llm_scorer.py` is OFF by default (no API
+key needed). Patents need a free `PATENTSVIEW_API_KEY` env var; without it that feed is skipped.
 
 ## Hard constraints
 

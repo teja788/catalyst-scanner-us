@@ -53,7 +53,7 @@ def _universe():
 def _build_pack(since_iso: str, version: int):
     """Assemble the pack for a window. Cached by (window, data-version) so we don't
     rebuild on every widget interaction; `version` bumps when data changes."""
-    stats = build_context_pack(since=datetime.fromisoformat(since_iso))
+    stats = build_context_pack(since=datetime.fromisoformat(since_iso), enrich_bodies=False)
     pack = json.loads(open(stats["json_path"], encoding="utf-8").read())
     md = open(stats["md_path"], encoding="utf-8").read()
     return stats, pack, md
