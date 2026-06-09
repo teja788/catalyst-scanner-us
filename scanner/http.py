@@ -69,10 +69,11 @@ class PoliteSession:
         if wait > 0:                            # sleep OUTSIDE the lock so threads overlap
             time.sleep(wait)
 
-    def get(self, url: str, *, timeout: int = 30, headers: dict | None = None, **kwargs) -> requests.Response:
-        """Throttled GET. Retries transient errors (429 / 5xx / network) with
-        backoff; raises immediately on other 4xx (e.g. an expected 404 for a
-        non-trading-day daily index). Raises on final failure.
+    def _request(self, method: str, url: str, *, timeout: int = 30,
+                 headers: dict | None = None, **kwargs) -> requests.Response:
+        """Throttled request. Retries transient errors (429 / 5xx / network) with
+        backoff (honouring Retry-After); raises immediately on other 4xx (e.g. an
+        expected 404 for a non-trading-day daily index). Raises on final failure.
 
         Per-request `headers` override the session defaults for that call only
         (used by edgar_get / nasdaq_get to swap the User-Agent / Accept).
@@ -80,8 +81,9 @@ class PoliteSession:
         last_exc: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             self._throttle()
+            resp = None
             try:
-                resp = self.session.get(url, timeout=timeout, headers=headers, **kwargs)
+                resp = self.session.request(method, url, timeout=timeout, headers=headers, **kwargs)
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_exc = exc  # network error — retry
             else:
@@ -89,13 +91,25 @@ class PoliteSession:
                     resp.raise_for_status()   # raises on other 4xx without retrying
                     return resp
                 last_exc = requests.HTTPError(f"{resp.status_code} from {url}")
-            backoff = self.delay * (2 ** (attempt - 1))
-            log.warning("GET %s failed (attempt %d/%d): %s — backing off %.2fs",
-                        url, attempt, self.max_retries, last_exc, backoff)
+            # The configured delay (~0.13s) is a rate gate, not a retry policy — back
+            # off at least 1s, doubling, and respect an explicit Retry-After.
+            backoff = max(1.0, self.delay) * (2 ** (attempt - 1))
+            if resp is not None and (resp.headers.get("Retry-After") or "").isdigit():
+                backoff = max(backoff, float(resp.headers["Retry-After"]))
+            log.warning("%s %s failed (attempt %d/%d): %s — backing off %.2fs",
+                        method, url, attempt, self.max_retries, last_exc, backoff)
             if attempt < self.max_retries:
                 time.sleep(backoff)
         assert last_exc is not None
         raise last_exc
+
+    def get(self, url: str, *, timeout: int = 30, headers: dict | None = None, **kwargs) -> requests.Response:
+        """Throttled GET with retry/backoff (see _request)."""
+        return self._request("GET", url, timeout=timeout, headers=headers, **kwargs)
+
+    def post(self, url: str, *, timeout: int = 30, headers: dict | None = None, **kwargs) -> requests.Response:
+        """Throttled POST with the same retry/backoff discipline (JSON APIs)."""
+        return self._request("POST", url, timeout=timeout, headers=headers, **kwargs)
 
     # -- SEC EDGAR: the required name+email User-Agent --------------------------
     def edgar_get(self, url: str, *, timeout: int = 30, **kwargs) -> requests.Response:

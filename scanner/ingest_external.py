@@ -21,10 +21,9 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import requests
-
 from scanner import store
 from scanner.config import load_settings
+from scanner.http import PoliteSession
 from scanner.universe import load_map
 
 log = logging.getLogger(__name__)
@@ -95,18 +94,23 @@ def _base(m: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Feed 1 — federal contract awards (USAspending.gov, no key)
 # --------------------------------------------------------------------------- #
-def fetch_contracts(start: str, end: str, idx: dict[str, dict[str, Any]], limit: int = 200) -> list[dict[str, Any]]:
+def fetch_contracts(session: PoliteSession, start: str, end: str,
+                    idx: dict[str, dict[str, Any]], limit: int = 200) -> list[dict[str, Any]]:
+    # date_type new_awards_only is essential: the default matches awards with ANY
+    # action in the window, and "Award Amount" is cumulative-to-date — verified live
+    # to surface a 1993 Lockheed DOE contract ($48B) on a routine modification.
     payload = {
         "filters": {"award_type_codes": ["A", "B", "C", "D"],
-                    "time_period": [{"start_date": start, "end_date": end}]},
+                    "time_period": [{"start_date": start, "end_date": end,
+                                     "date_type": "new_awards_only"}]},
         "fields": ["Award ID", "Recipient Name", "Award Amount", "Awarding Agency", "Description", "Start Date"],
         "limit": min(limit, 100), "page": 1, "sort": "Award Amount", "order": "desc",
     }
     out: list[dict[str, Any]] = []
     try:
-        r = requests.post("https://api.usaspending.gov/api/v2/search/spending_by_award/",
-                          json=payload, headers={"User-Agent": _ua()}, timeout=45)
-        r.raise_for_status()
+        r = session.post("https://api.usaspending.gov/api/v2/search/spending_by_award/",
+                         json=payload, timeout=45,
+                         headers={"User-Agent": _ua(), "Accept": "application/json"})
         results = r.json().get("results", [])
     except Exception as exc:  # noqa: BLE001
         log.warning("USAspending fetch failed: %s", exc)
@@ -116,67 +120,89 @@ def fetch_contracts(start: str, end: str, idx: dict[str, dict[str, Any]], limit:
         if not m:
             continue
         amt = a.get("Award Amount")
-        aid = a.get("Generated Internal ID") or a.get("Award ID") or ""
+        # the award PAGE needs the generated id (snake_case key, returned
+        # automatically) — a bare PIID ("Award ID") does not resolve.
+        aid = a.get("generated_internal_id") or a.get("Award ID") or ""
         agency = a.get("Awarding Agency") or ""
         pop = a.get("Start Date") or ""
         out.append({**_base(m), "source": "USAspending", "category": "contract",
                     "headline": (f"Federal contract ${amt:,.0f} — {agency}" if amt else f"Federal contract — {agency}"),
                     "detail": ((a.get("Description") or "")[:280] + (f" (PoP start {pop})" if pop else "")), "amount": amt,
-                    "url": f"https://www.usaspending.gov/award/{a.get('Award ID') or aid}",
-                    "event_date": end,   # time_period filter already guarantees a recent award action
+                    "url": f"https://www.usaspending.gov/award/{aid}",
+                    "event_date": pop or end,   # new_awards_only: Start Date ~ award date
                     "dedupe_hash": _hash("usasp", a.get("Award ID") or aid, m["cik"])})
+    if len(results) >= payload["limit"]:
+        log.info("USAspending: window returned >=%d awards — smallest new awards may be cut "
+                 "by the top-by-amount page", payload["limit"])
     return out
 
 
 # --------------------------------------------------------------------------- #
 # Feed 2 — drug approvals (openFDA) + Phase-3 readouts (ClinicalTrials.gov v2)
 # --------------------------------------------------------------------------- #
-def fetch_fda(start: str, end: str, idx: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def fetch_fda(session: PoliteSession, start: str, end: str,
+              idx: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    hdr = {"User-Agent": _ua()}
+    hdr = {"User-Agent": _ua(), "Accept": "application/json"}
     s_compact, e_compact = start.replace("-", ""), end.replace("-", "")
-    # 2a. openFDA — recent drug approvals
+    # 2a. openFDA — recent drug approvals. The search matches the APPLICATION if ANY
+    # submission matches, so re-check the submissions list for the approval that
+    # actually falls in the window, and label ORIG (new approval) vs supplement.
     try:
-        r = requests.get("https://api.fda.gov/drug/drugsfda.json", headers=hdr, timeout=30, params={
+        r = session.get("https://api.fda.gov/drug/drugsfda.json", headers=hdr, timeout=30, params={
             "search": f"submissions.submission_status_date:[{s_compact} TO {e_compact}] AND submissions.submission_status:AP",
             "limit": 100})
-        if r.status_code == 200:
-            for app in r.json().get("results", []):
-                m = match_org(app.get("sponsor_name", ""), idx)
-                if not m:
-                    continue
-                prods = app.get("products") or [{}]
-                brand = (prods[0].get("brand_name") or prods[0].get("generic_name") or "drug")
-                appno = app.get("application_number", "")
-                out.append({**_base(m), "source": "openFDA", "category": "fda",
-                            "headline": f"FDA approval: {brand}", "detail": f"{app.get('sponsor_name','')} — application {appno}",
-                            "amount": None, "url": f"https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=overview.process&ApplNo={appno.split('-')[-1] if appno else ''}",
-                            "event_date": end, "dedupe_hash": _hash("openfda", appno, m["cik"])})
-    except Exception as exc:  # noqa: BLE001
-        log.warning("openFDA fetch failed: %s", exc)
-    # 2b. ClinicalTrials.gov v2 — recently-updated Phase-3 studies with results
+        for app in r.json().get("results", []):
+            m = match_org(app.get("sponsor_name", ""), idx)
+            if not m:
+                continue
+            subs = [s for s in (app.get("submissions") or [])
+                    if s.get("submission_status") == "AP"
+                    and s_compact <= (s.get("submission_status_date") or "") <= e_compact]
+            if not subs:
+                continue
+            sub = max(subs, key=lambda s: s.get("submission_status_date") or "")
+            stype = sub.get("submission_type") or ""
+            sdate = sub.get("submission_status_date") or ""
+            event = f"{sdate[:4]}-{sdate[4:6]}-{sdate[6:8]}" if len(sdate) == 8 else end
+            prods = app.get("products") or [{}]
+            brand = (prods[0].get("brand_name") or prods[0].get("generic_name") or "drug")
+            appno = app.get("application_number", "")
+            kind = "FDA approval" if stype == "ORIG" else "FDA supplemental approval"
+            # the Drugs@FDA page wants the numeric ApplNo ("NDA220837" -> "220837")
+            out.append({**_base(m), "source": "openFDA", "category": "fda",
+                        "headline": f"{kind}: {brand}",
+                        "detail": f"{app.get('sponsor_name','')} — {appno} · {stype} "
+                                  f"{(sub.get('submission_class_code_description') or '').strip()}".strip(),
+                        "amount": None,
+                        "url": f"https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=overview.process&ApplNo={re.sub(r'[^0-9]', '', appno)}",
+                        "event_date": event, "dedupe_hash": _hash("openfda", appno, sdate, m["cik"])})
+    except Exception as exc:  # noqa: BLE001 - openFDA 404s an empty result set
+        log.warning("openFDA fetch failed (404 = no approvals in window): %s", exc)
+    # 2b. ClinicalTrials.gov v2 — Phase-3 studies whose RESULTS were posted in the
+    # window. Keying on lastUpdatePostDate alone surfaced stale trials bumped by
+    # admin record edits; results-posted is the actual readout event.
     try:
-        r = requests.get("https://clinicaltrials.gov/api/v2/studies", headers=hdr, timeout=30, params={
-            "filter.advanced": "AREA[Phase]PHASE3", "filter.overallStatus": "COMPLETED",
-            "sort": "LastUpdatePostDate:desc", "pageSize": 80})
-        if r.status_code == 200:
-            for st in r.json().get("studies", []):
-                ps = st.get("protocolSection", {})
-                spon = (((ps.get("sponsorCollaboratorsModule") or {}).get("leadSponsor") or {}).get("name") or "")
-                m = match_org(spon, idx)
-                if not m:
-                    continue
-                ident = ps.get("identificationModule") or {}
-                status = ps.get("statusModule") or {}
-                upd = ((status.get("lastUpdatePostDateStruct") or {}).get("date") or "")
-                if upd and upd < start:        # only the window
-                    continue
-                nct = ident.get("nctId", "")
-                out.append({**_base(m), "source": "ClinicalTrials", "category": "fda",
-                            "headline": f"Phase 3 completed: {(ident.get('briefTitle') or '')[:90]}",
-                            "detail": f"{spon} — {nct}", "amount": None,
-                            "url": f"https://clinicaltrials.gov/study/{nct}",
-                            "event_date": upd or end, "dedupe_hash": _hash("ctgov", nct, m["cik"])})
+        r = session.get("https://clinicaltrials.gov/api/v2/studies", headers=hdr, timeout=30, params={
+            "filter.advanced": "AREA[Phase]PHASE3", "aggFilters": "results:with",
+            "sort": "LastUpdatePostDate:desc", "pageSize": 100})
+        for st in r.json().get("studies", []):
+            ps = st.get("protocolSection", {})
+            spon = (((ps.get("sponsorCollaboratorsModule") or {}).get("leadSponsor") or {}).get("name") or "")
+            m = match_org(spon, idx)
+            if not m:
+                continue
+            ident = ps.get("identificationModule") or {}
+            status = ps.get("statusModule") or {}
+            posted = ((status.get("resultsFirstPostDateStruct") or {}).get("date") or "")
+            if not posted or posted < start or posted > end:   # results must land in window
+                continue
+            nct = ident.get("nctId", "")
+            out.append({**_base(m), "source": "ClinicalTrials", "category": "fda",
+                        "headline": f"Phase 3 results posted: {(ident.get('briefTitle') or '')[:90]}",
+                        "detail": f"{spon} — {nct}", "amount": None,
+                        "url": f"https://clinicaltrials.gov/study/{nct}",
+                        "event_date": posted, "dedupe_hash": _hash("ctgov", nct, m["cik"])})
     except Exception as exc:  # noqa: BLE001
         log.warning("ClinicalTrials fetch failed: %s", exc)
     return out
@@ -185,7 +211,8 @@ def fetch_fda(start: str, end: str, idx: dict[str, dict[str, Any]]) -> list[dict
 # --------------------------------------------------------------------------- #
 # Feed 3 — patent grants (USPTO PatentsView; free API key via PATENTSVIEW_API_KEY)
 # --------------------------------------------------------------------------- #
-def fetch_patents(start: str, end: str, idx: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def fetch_patents(session: PoliteSession, start: str, end: str,
+                  idx: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     key = os.environ.get("PATENTSVIEW_API_KEY", "")
     if not key:
         log.info("PatentsView: no PATENTSVIEW_API_KEY set — skipping patents feed")
@@ -193,13 +220,17 @@ def fetch_patents(start: str, end: str, idx: dict[str, dict[str, Any]]) -> list[
     out: list[dict[str, Any]] = []
     import json as _json
     try:
-        r = requests.get("https://search.patentsview.org/api/v1/patent/",
-                         headers={"User-Agent": _ua(), "X-Api-Key": key}, timeout=40, params={
-                             "q": _json.dumps({"_and": [{"_gte": {"patent_date": start}}, {"_lte": {"patent_date": end}}]}),
-                             "f": _json.dumps(["patent_id", "patent_title", "patent_date", "assignees.assignee_organization"]),
-                             "o": _json.dumps({"size": 100})})
-        r.raise_for_status()
-        for p in r.json().get("patents", []):
+        r = session.get("https://search.patentsview.org/api/v1/patent/",
+                        headers={"User-Agent": _ua(), "X-Api-Key": key}, timeout=40, params={
+                            "q": _json.dumps({"_and": [{"_gte": {"patent_date": start}}, {"_lte": {"patent_date": end}}]}),
+                            "f": _json.dumps(["patent_id", "patent_title", "patent_date", "assignees.assignee_organization"]),
+                            "s": _json.dumps([{"patent_date": "desc"}]),
+                            "o": _json.dumps({"size": 1000})})
+        patents = r.json().get("patents", []) or []
+        if len(patents) >= 1000:
+            log.info("PatentsView: window has >=1000 grants — older grants in window not sampled "
+                     "(narrow the window or paginate if patent coverage matters)")
+        for p in patents:
             org = ""
             for asg in (p.get("assignees") or []):
                 org = asg.get("assignee_organization") or ""
@@ -222,16 +253,17 @@ def fetch_patents(start: str, end: str, idx: dict[str, dict[str, Any]]) -> list[
 # --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
-def ingest(days: int = 30, conn=None) -> dict[str, int]:
+def ingest(days: int = 30, conn=None, session: PoliteSession | None = None) -> dict[str, int]:
     """Fetch all external feeds for the last `days`, match to universe, store."""
+    session = session or PoliteSession()
     end = _today().date().isoformat()
     start = (_today() - timedelta(days=days)).date().isoformat()
     idx = build_name_index()
     rows: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
-    for name, fn in (("contracts", lambda: fetch_contracts(start, end, idx)),
-                     ("fda", lambda: fetch_fda(start, end, idx)),
-                     ("patents", lambda: fetch_patents(start, end, idx))):
+    for name, fn in (("contracts", lambda: fetch_contracts(session, start, end, idx)),
+                     ("fda", lambda: fetch_fda(session, start, end, idx)),
+                     ("patents", lambda: fetch_patents(session, start, end, idx))):
         try:
             got = fn()
         except Exception as exc:  # noqa: BLE001
