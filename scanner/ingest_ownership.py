@@ -7,9 +7,11 @@ Three disclosure signals, all discovered via the shared daily index (M3):
   - 13F-HR               : quarterly institutional holdings (SLOW / lagged signal)
 
 Indexing facts verified live (2026-06):
-  - For Form 4 and SCHEDULE 13*, the daily-index CIK is the ISSUER (subject
-    company) -> filter cheaply to our universe by that CIK; the FILER (the
-    investor/insider) comes from the filing's full-submission .txt.
+  - The daily index lists a filing under EVERY associated CIK — for Form 4 and
+    SCHEDULE 13* that means BOTH the subject company AND the filer get a row
+    (same accession). We filter cheaply by universe CIK, dedupe by accession,
+    then re-key each record to the TRUE subject parsed from the document itself
+    (SGML SUBJECT COMPANY / <issuerCik>) so a filer-side match can't mis-key it.
   - For 13F-HR, the daily-index CIK is the FILER (the manager) -> match the
     daily-index company NAME against the superinvestor watchlist instead.
 
@@ -126,6 +128,29 @@ def _acceptance_iso(text: str, fallback_date: str) -> str:
         return fallback_date
 
 
+def _subject_cik_int(text: str, form: str) -> int | None:
+    """The TRUE subject/issuer CIK, read from the document itself.
+
+    The daily index lists a filing under EVERY associated CIK — subject AND filer —
+    (verified live: the GameStop→eBay 13D/A appears under both 1326380 and 1065088),
+    so the index-row CIK alone cannot tell which side we matched. Form 4 carries
+    <issuerCik> in its XML; 13D/13G carry a SUBJECT COMPANY block in the SGML header
+    (modern ones also an <issuerCIK> XML tag)."""
+    if form.startswith("4"):
+        m = re.search(r"<issuerCik>(\d+)</issuerCik>", text, re.I)
+        if not m:   # legacy fallback: the SGML header's ISSUER block
+            i = text.find("ISSUER:")
+            m = re.search(r"CENTRAL INDEX KEY:\s*(\d+)", text[i:i + 800]) if i >= 0 else None
+        return int(m.group(1)) if m else None
+    i = text.find("SUBJECT COMPANY")
+    if i >= 0:
+        m = re.search(r"CENTRAL INDEX KEY:\s*(\d+)", text[i:i + 800])
+        if m:
+            return int(m.group(1))
+    m = re.search(r"<issuerCIK>(\d+)</issuerCIK>", text, re.I)   # modern 13D/G XML
+    return int(m.group(1)) if m else None
+
+
 # --------------------------------------------------------------------------- #
 # Per-form parsers
 # --------------------------------------------------------------------------- #
@@ -208,7 +233,9 @@ def _amendment_detail(full_txt: str, form: str) -> str:
     # isolate the primary SC 13 document (skip exhibits), strip tags
     body = full_txt
     for d in full_txt.split("<DOCUMENT>"):
-        if re.search(r"<TYPE>\s*SC 13", d):
+        # legacy primary docs are <TYPE>SC 13D/A; post-2024 structured ones are
+        # <TYPE>SCHEDULE 13D/A (verified live) — match both.
+        if re.search(r"<TYPE>\s*(?:SC|SCHEDULE)\s*13", d):
             body = d
             break
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body))
@@ -280,35 +307,45 @@ def ingest(session: PoliteSession | None = None,
     by_cik = {int(c["cik"]): c for c in load_map()}
     watchlist = _superinvestors()
 
-    # 1. Discover from the daily index.
+    # 1. Discover from the daily index. A filing appears under EVERY associated CIK
+    #    (subject AND filer), so dedupe by accession here — the true subject company
+    #    is re-derived from the document in _process_issuer either way.
     issuer_hits: list[dict[str, Any]] = []     # Form 4 / 13D / 13G about our companies
     f13_hits: list[dict[str, Any]] = []        # 13F-HR by a watchlist manager
+    seen_acc: set[str] = set()
     for d in _iter_dates(since, until):
         for r in fetch_daily_index(session, d):
             if r["form"] in forms and r["cik"] in by_cik:
-                issuer_hits.append(r)
-            elif r["form"].startswith("13F"):
+                if r["accession"] not in seen_acc:
+                    seen_acc.add(r["accession"])
+                    issuer_hits.append(r)
+            elif r["form"] in ("13F-HR", "13F-HR/A"):   # skip 13F-NT notices (no holdings)
                 if _match_investor(r["company"], watchlist):
                     f13_hits.append(r)
 
     # 2. Issuer-keyed forms (Form 4 + 13D/13G): fetch each .txt once, parse.
     #    Fetched concurrently (latency-hiding) under the shared SEC rate gate.
     def _process_issuer(r: dict[str, Any]) -> dict[str, Any] | None:
-        meta = by_cik[r["cik"]]
         try:
             text = session.edgar_get(_txt_url(r["cik"], r["accession"]), timeout=45).text
         except Exception as exc:  # noqa: BLE001 - isolate per-filing failures
             log.warning("ownership .txt %s -> %s", r["accession"], exc)
             return None
+        # Re-key to the TRUE subject company from the document — the index row we
+        # matched may be the FILER's side (e.g. GameStop filing a 13D/A on eBay).
+        subj = _subject_cik_int(text, r["form"]) or r["cik"]
+        meta = by_cik.get(subj)
+        if meta is None:
+            return None   # filer-side row of a filing about a non-universe company
         is_13d = r["form"].startswith("SCHEDULE 13D")
         if r["form"].startswith("4"):
             p = _parse_form4(text)
             rec = {**p, "form_type": r["form"], "is_insider": 1, "is_activist": 0, "detail": ""}
         else:  # SCHEDULE 13D / 13G
             p = _parse_sc13(text)
-            # Self-filing (filer CIK == issuer CIK) is a treasury/subsidiary 13D, not
-            # an external activist stake — don't flag it (e.g. "JPM 100% stake").
-            is_self = bool(p["filer_cik"]) and p["filer_cik"].lstrip("0") == str(r["cik"])
+            # Self-filing (filer CIK == subject CIK) is a treasury/subsidiary 13D, not
+            # an external activist stake — don't flag it.
+            is_self = bool(p["filer_cik"]) and int(p["filer_cik"]) == subj
             rec = {"filer_name": p["filer_name"], "relationship": "", "side": "STAKE",
                    "shares": None, "price": None, "pct": p["pct"], "is_buy": 0,
                    "form_type": r["form"], "is_insider": 0,
@@ -319,7 +356,7 @@ def ingest(session: PoliteSession | None = None,
             "cik": meta["cik"],
             "company": meta.get("name") or r["company"],
             "matched_investor": _match_investor(rec.get("filer_name", ""), watchlist),
-            "filing_url": _index_url(r["cik"], r["accession"]),
+            "filing_url": _index_url(subj, r["accession"]),
             "filed_at": _acceptance_iso(text, r["date"]),
             "accession": r["accession"],
             "dedupe_hash": _dedupe_hash(r["accession"]),
