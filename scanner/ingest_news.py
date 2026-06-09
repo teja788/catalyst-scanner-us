@@ -45,11 +45,15 @@ TICKER_STOPWORDS = {
     "SO", "OR", "BY", "AN", "AT", "BE", "GO", "UP", "US", "TV", "PM", "EV", "HE", "WE",
     "IR", "DE", "PR", "FY", "CFO", "COO", "ESG", "IPO", "ETF", "USA", "USD",
     "SEC", "FDA", "ROI", "EPS", "GDP", "ADR", "ADS", "EST", "CET", "TSX", "NYSE", "AM",
+    "GPS",   # Gap's ticker, but headlines say GPS the technology
+    "SNAP",  # Snap's ticker, but policy headlines say "SNAP benefits" (food stamps)
 }
 
 # Company NAME aliases too generic to tag on — they collide with ubiquitous
-# exchange mentions ("...lists on Nasdaq"). The company still tags via its ticker.
-ALIAS_STOPWORDS = {"nasdaq", "nyse"}
+# exchange mentions ("...lists on Nasdaq") or with common English words that
+# Title-Case headlines capitalise ("Price Target Raised" is not Target Corp).
+# Precision over recall: these companies tag via an explicit ticker/name instead.
+ALIAS_STOPWORDS = {"nasdaq", "nyse", "target", "gap", "block", "shell", "snap"}
 
 
 # --------------------------------------------------------------------------- #
@@ -78,6 +82,11 @@ class Tagger:
                 ticker_map.setdefault(ticker, cik)
             for alias in c.get("aliases", []):
                 if alias in ALIAS_STOPWORDS:
+                    # the short alias is too generic ("target"), but the FULL formal
+                    # name ("target corporation") is still distinctive — keep that path
+                    full = re.sub(r"\s+", " ", re.sub(r"[^\w\s&]", " ", (c.get("name") or "").lower())).strip()
+                    if " " in full:
+                        multi_map.setdefault(full, cik)
                     continue
                 if " " in alias:
                     multi_map.setdefault(alias, cik)

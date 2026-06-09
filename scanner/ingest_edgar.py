@@ -102,10 +102,20 @@ def _iter_dates(since: datetime, until: datetime) -> Iterable[date]:
         d += timedelta(days=1)
 
 
+# Per-process daily-index cache: the EDGAR and ownership ingesters sweep the SAME
+# index days in one refresh — fetch each day once. PAST days only: the current
+# day's index grows intraday, so caching it in a long-lived process (dashboard)
+# would serve stale snapshots. Bounded so it can't grow unboundedly.
+_IDX_CACHE: dict[date, list[dict[str, Any]]] = {}
+_IDX_CACHE_MAX = 40
+
+
 def fetch_daily_index(session: PoliteSession, d: date) -> list[dict[str, Any]]:
     """Return parsed rows for one filing day, or [] if no index (weekend/holiday)."""
     import requests
 
+    if d in _IDX_CACHE:
+        return _IDX_CACHE[d]
     base = load_sources().get("edgar", {}).get(
         "daily_index_base", "https://www.sec.gov/Archives/edgar/daily-index")
     q = (d.month - 1) // 3 + 1
@@ -116,8 +126,14 @@ def fetch_daily_index(session: PoliteSession, d: date) -> list[dict[str, Any]]:
         code = getattr(exc.response, "status_code", None)
         if code not in (403, 404):
             log.warning("daily index %s -> %s", url, exc)
-        return []   # 403/404 = non-trading day (SEC's CDN 403s missing files): no filings
-    return _parse_idx(text)
+        rows: list[dict[str, Any]] = []   # 403/404 = non-trading day: no filings
+    else:
+        rows = _parse_idx(text)
+    if d < _now().date():               # never cache today's still-growing index
+        if len(_IDX_CACHE) >= _IDX_CACHE_MAX:
+            _IDX_CACHE.clear()
+        _IDX_CACHE[d] = rows
+    return rows
 
 
 def _parse_idx(text: str) -> list[dict[str, Any]]:
@@ -156,15 +172,12 @@ def _fetch_submissions(session: PoliteSession, cik10: str) -> dict[str, dict[str
         log.warning("submissions %s -> %s", cik10, exc)
         return {}
     out: dict[str, dict[str, Any]] = {}
-    accs = recent.get("accessionNumber", [])
+    accs = recent.get("accessionNumber") or []
     for i, acc in enumerate(accs):
-        out[acc] = {
-            "items": recent.get("items", [""] * len(accs))[i],
-            "acceptanceDateTime": recent.get("acceptanceDateTime", [""] * len(accs))[i],
-            "primaryDocument": recent.get("primaryDocument", [""] * len(accs))[i],
-            "primaryDocDescription": recent.get("primaryDocDescription", [""] * len(accs))[i],
-            "reportDate": recent.get("reportDate", [""] * len(accs))[i],
-        }
+        # `or` (not a .get default) so a key present-but-null can't blow up
+        out[acc] = {k: (recent.get(k) or [""] * len(accs))[i]
+                    for k in ("items", "acceptanceDateTime", "primaryDocument",
+                              "primaryDocDescription", "reportDate")}
     return out
 
 

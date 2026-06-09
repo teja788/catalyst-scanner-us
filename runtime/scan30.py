@@ -13,11 +13,12 @@ from zoneinfo import ZoneInfo
 
 # Make `scanner` importable regardless of how this script is launched
 # (running runtime/scan30.py puts runtime/ on sys.path, not the project root).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
 
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[logging.FileHandler("runtime/scan30.log", encoding="utf-8")],
+    handlers=[logging.FileHandler(os.path.join(_ROOT, "runtime", "scan30.log"), encoding="utf-8")],
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     force=True,
 )

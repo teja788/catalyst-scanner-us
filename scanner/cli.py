@@ -209,7 +209,7 @@ def _refresh_all(since_override: datetime | None = None,
 
     def _external():
         # Federal contracts / FDA-clinical / patents — slower-moving; pull last 30d, dedupe.
-        c = ingest_external.ingest(days=30)
+        c = ingest_external.ingest(days=30, session=session)
         return sum(c.get(k, 0) for k in ("contracts", "fda", "patents")), c.get("new", 0)
 
     if "edgar" in run:
@@ -415,8 +415,9 @@ def schedule(install: bool = typer.Option(False, "--install", help="Actually cre
     evening = str(cfg.get("evening_catchup_local", "02:00"))
     bat = resolve_path("scheduled_refresh.bat")
     name_45, name_eve = "catalyst-us-refresh", "catalyst-us-evening-catchup"
-    create_45 = ["schtasks", "/Create", "/TN", name_45, "/TR", str(bat), "/SC", "MINUTE", "/MO", str(every), "/F"]
-    create_eve = ["schtasks", "/Create", "/TN", name_eve, "/TR", str(bat), "/SC", "DAILY", "/ST", evening, "/F"]
+    # /TR gets embedded quotes so a project path containing spaces still works.
+    create_45 = ["schtasks", "/Create", "/TN", name_45, "/TR", f'"{bat}"', "/SC", "MINUTE", "/MO", str(every), "/F"]
+    create_eve = ["schtasks", "/Create", "/TN", name_eve, "/TR", f'"{bat}"', "/SC", "DAILY", "/ST", evening, "/F"]
 
     if remove:
         for name in (name_45, name_eve):

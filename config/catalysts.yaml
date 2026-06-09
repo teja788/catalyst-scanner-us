@@ -13,7 +13,13 @@ eightk_items:
   "2.01": [m_and_a]                         # completion of acquisition/disposition
   "2.02": [earnings]                        # results of operations & financial condition
   "2.03": [debt]                            # creation of a material direct financial obligation
+  "2.04": [distress, debt]                  # triggering events accelerating a financial obligation
+  "2.05": [restructuring]                   # exit / disposal costs (layoffs, closures)
+  "2.06": [impairment]                      # material impairments (write-downs)
+  "3.01": [distress, delisting]             # delisting notice / listing-rule failure
   "3.02": [capital_action]                  # unregistered sales of equity (dilution)
+  "4.01": [accounting]                      # change of certifying accountant
+  "4.02": [distress, accounting]            # non-reliance on prior financials (restatement)
   "5.01": [control_change]                  # changes in control of registrant
   "5.02": [mgmt_change]                     # departure/appointment of directors or officers
   "7.01": [reg_fd]                          # Regulation FD disclosure (often the PR)
@@ -94,11 +100,17 @@ keywords:
     - preliminary results
     - guidance increase
   index_inclusion:
+    # NOTE: keep these SPECIFIC — a bare "added to the" used to false-tag every
+    # "added to the Board of Directors" 8-K as an index-inclusion catalyst.
     - s&p 500
     - nasdaq-100
     - russell 1000
     - index inclusion
-    - added to the
+    - added to the s&p
+    - added to the nasdaq
+    - added to the russell
+    - joins the s&p
+    - set to join the s&p
     - join the index
   mgmt_change:
     - appointed ceo

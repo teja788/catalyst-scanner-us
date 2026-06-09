@@ -44,9 +44,10 @@ activist stakes, insider buys, completed M&A / distress / control-change 8-Ks,
 **business CATALYSTS read from filing bodies** (lucrative contracts, capacity
 expansions, FDA/clinical, partnerships, patents — financing/comp filtered out), and
 **EXTERNAL feeds** (federal contract awards via USAspending, FDA drug approvals +
-ClinicalTrials Phase-3 readouts, USPTO patents) — and is **never truncated** (the
-verbose SEC FILINGS list below it is capped for readability). This guarantees the top
-signals are never lost in a large window.
+ClinicalTrials Phase-3 readouts, USPTO patents) — and is **never silently truncated**:
+generous per-bucket caps keep it readable and any overflow appears as an explicit
+"… N more in window" line (the verbose SEC FILINGS list below it is capped for
+readability). This guarantees the top signals are never lost in a large window.
 
 > The tool's purpose is BROAD asymmetric opportunities — not just ownership. Weight the
 > CATALYSTS / FDA / CONTRACTS signals as highly as activist/insider ones: a Phase-3

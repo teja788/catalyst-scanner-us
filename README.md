@@ -71,8 +71,8 @@ same `scanner` functions (no new data logic):
 - `config/superinvestors.yaml` — marquee/activist filer watchlist
 - `config/noise_filters.yaml` — routine items to drop / down-rank
 
-**Universe size:** `top_n` in `settings.yaml` starts at **500** for fast iteration; set it to
-**5000** for full coverage — no code change required.
+**Universe size:** `top_n` in `settings.yaml` defaults to **5000** (full coverage across the
+chosen exchanges); drop it to e.g. **500** for faster iteration — no code change required.
 
 ## Build milestones
 
