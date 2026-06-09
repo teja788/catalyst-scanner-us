@@ -158,9 +158,12 @@ def _now_iso() -> str:
 
 
 def get_conn() -> sqlite3.Connection:
-    """Open the DB (creating the file/dir on first use) with Row access."""
+    """Open the DB (creating the file/dir on first use) with Row access.
+
+    timeout=30: the scheduled refresh, CLI, and dashboard can write concurrently
+    (WAL allows one writer) — wait out a busy writer instead of raising."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
@@ -356,7 +359,7 @@ def counts(conn: sqlite3.Connection | None = None) -> dict[str, int]:
     conn = conn or get_conn()
     try:
         return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
-                for t in ("companies", "filings", "news", "ownership")}
+                for t in ("companies", "filings", "news", "ownership", "external_catalysts")}
     finally:
         if own:
             conn.close()
@@ -368,7 +371,8 @@ def coverage(conn: sqlite3.Connection | None = None) -> dict[str, dict[str, Any]
     conn = conn or get_conn()
     try:
         out: dict[str, dict[str, Any]] = {}
-        for table, col in (("filings", "filed_at"), ("news", "published_at"), ("ownership", "filed_at")):
+        for table, col in (("filings", "filed_at"), ("news", "published_at"),
+                           ("ownership", "filed_at"), ("external_catalysts", "event_date")):
             row = conn.execute(f"SELECT COUNT(*) n, MIN({col}) lo, MAX({col}) hi FROM {table}").fetchone()
             out[table] = {"count": row["n"], "earliest": row["lo"], "latest": row["hi"]}
         return out
@@ -439,6 +443,23 @@ def set_filing_tags(filing_id: int, tags: list[str], conn: sqlite3.Connection | 
     conn = conn or get_conn()
     try:
         conn.execute("UPDATE filings SET candidate_tags=? WHERE id=?", (json.dumps(tags), filing_id))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def set_filing_tags_bulk(pairs: list[tuple[int, list[str]]],
+                         conn: sqlite3.Connection | None = None) -> None:
+    """Persist candidate_tags for many filings in ONE transaction (the prefilter
+    re-tags every filing in the window — per-row commits made that O(rows) fsyncs)."""
+    if not pairs:
+        return
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        conn.executemany("UPDATE filings SET candidate_tags=? WHERE id=?",
+                         [(json.dumps(tags), fid) for fid, tags in pairs])
         conn.commit()
     finally:
         if own:

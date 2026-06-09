@@ -50,12 +50,18 @@ def _universe():
 
 
 @st.cache_data(show_spinner=False)
-def _build_pack(since_iso: str, version: int):
-    """Assemble the pack for a window. Cached by (window, data-version) so we don't
-    rebuild on every widget interaction; `version` bumps when data changes."""
-    stats = build_context_pack(since=datetime.fromisoformat(since_iso), enrich_bodies=False)
-    pack = json.loads(open(stats["json_path"], encoding="utf-8").read())
-    md = open(stats["md_path"], encoding="utf-8").read()
+def _build_pack(total_h: int, version: int):
+    """Assemble the pack for a window. Cached by (window SIZE, data-version) — a
+    fresh `since` timestamp would change every rerun and defeat the cache, so the
+    instant is computed in here. `version` bumps when data changes. Bodies come
+    from the filing_text cache only (zero network), so body-derived catalyst tags
+    still reach the dashboard pack."""
+    since = _now() - timedelta(hours=total_h)
+    stats = build_context_pack(since=since, enrich_bodies=True, fetch_bodies=False)
+    with open(stats["json_path"], encoding="utf-8") as fh:
+        pack = json.load(fh)
+    with open(stats["md_path"], encoding="utf-8") as fh:
+        md = fh.read()
     return stats, pack, md
 
 
@@ -108,8 +114,10 @@ with st.sidebar:
     st.header("🔄 Data")
     cov = store.coverage()
     f, o, n = cov["filings"], cov["ownership"], cov["news"]
+    e = cov.get("external_catalysts", {"count": 0, "latest": None})
     st.caption(f"Filings: {f['count']} stored · latest {(f['latest'] or '—')[:10]}")
-    st.caption(f"Ownership: {o['count']} · News: {n['count']}")
+    st.caption(f"Ownership: {o['count']} · News: {n['count']} · "
+               f"External: {e['count']} (latest {(e['latest'] or '—')[:10]})")
 
     c1, c2 = st.columns(2)
     if c1.button("Update news", help="Incremental — only new news since last fetch (~10s)"):
@@ -144,7 +152,7 @@ st.caption("Asymmetric-opportunity scanner for the top US-listed companies "
            "(SEC EDGAR filings + 13D/13G/Form-4 ownership + wires/news). "
            "Research leads only — **not investment advice**.")
 
-stats, pack, md = _build_pack(since.isoformat(), st.session_state["data_version"])
+stats, pack, md = _build_pack(total_h, st.session_state["data_version"])
 
 m = st.columns(5)
 m[0].metric("Window", f"{total_h}h")
@@ -173,6 +181,9 @@ with tab_sig:
                         from scanner.scoring import llm_scorer
                         ranked = llm_scorer.score(md, provider=provider, model=model, api_key=api_key)
                     st.session_state["ranked"] = ranked
+                    # remember what the ranking was FOR, so a stale rank isn't
+                    # shown against a different window / refreshed data
+                    st.session_state["ranked_key"] = (total_h, st.session_state["data_version"])
                     from scanner import research_log
                     status = research_log.save(
                         ranked, title=f"Dashboard AI rank ({provider}, {total_h}h)",
@@ -180,7 +191,8 @@ with tab_sig:
                     st.caption(f"📝 Research log: {status} → digests/research_log.md")
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"AI ranking failed: {exc}")
-        if st.session_state.get("ranked"):
+        if (st.session_state.get("ranked")
+                and st.session_state.get("ranked_key") == (total_h, st.session_state["data_version"])):
             st.markdown(st.session_state["ranked"])
             st.divider()
     else:

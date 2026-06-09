@@ -124,6 +124,7 @@ def run_prefilter(since: datetime | None = None) -> dict[str, Any]:
 
         # --- Filings: tag everything (already form-filtered); mark procedural-only ---
         routine = 0
+        tag_updates: list[tuple[int, list[str]]] = []
         for f in filings:
             items = _as_list(f.get("item_codes"))
             tags = tag_filing(f.get("form_type", ""), items, f.get("headline", ""), f.get("body_text", ""))
@@ -133,9 +134,13 @@ def run_prefilter(since: datetime | None = None) -> dict[str, Any]:
                           and bool(items) and set(items) <= _PROCEDURAL_ITEMS)
             f["is_routine"] = is_routine
             routine += int(is_routine)
-            store.set_filing_tags(f["id"], tags, conn=conn)
+            tag_updates.append((f["id"], tags))
+        store.set_filing_tags_bulk(tag_updates, conn=conn)
 
-        # --- News: tag; keep company-tagged OR catalyst-tagged; drop noisy untagged ---
+        # --- News: tag; keep company-tagged OR catalyst-tagged; drop noisy untagged.
+        #     Kept items that still match a routine pattern (conference invites,
+        #     webcasts, record dates) are MARKED is_noise so the pack can downrank
+        #     and label them — noise_filters.yaml is wired in, not just counted. ---
         news_candidates: list[dict[str, Any]] = []
         news_noise = 0
         for n in news:
@@ -144,6 +149,8 @@ def run_prefilter(since: datetime | None = None) -> dict[str, Any]:
             n["company_ciks"] = _as_list(n.get("company_ciks"))
             has_company = bool(n["company_ciks"])
             if has_company or tags:
+                n["is_noise"] = is_noise(n.get("headline", ""))
+                news_noise += int(n["is_noise"])
                 news_candidates.append(n)
             elif is_noise(n.get("headline", "")):
                 news_noise += 1

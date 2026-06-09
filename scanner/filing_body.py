@@ -36,13 +36,15 @@ def extract_text(html: str) -> str:
     return re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
 
 
-def _body_for(session: PoliteSession, f: dict[str, Any]) -> str:
-    """Return cached or freshly-fetched body text for one filing."""
+def _body_for(session: PoliteSession, f: dict[str, Any], fetch_missing: bool = True) -> str:
+    """Return cached (or, if `fetch_missing`, freshly-fetched) body text for one filing."""
     h = f.get("dedupe_hash")
     if h:
         cached = store.get_filing_text(h)
         if cached and cached.get("text"):
             return cached["text"]
+    if not fetch_missing:
+        return ""
     url = f.get("filing_url") or ""
     if not url.lower().endswith((".htm", ".html", ".txt")):
         return ""
@@ -58,18 +60,27 @@ def _body_for(session: PoliteSession, f: dict[str, Any]) -> str:
 
 
 def enrich(filings: list[dict[str, Any]], session: PoliteSession | None = None,
-           max_fetch: int = 80) -> list[dict[str, Any]]:
+           max_fetch: int = 80, fetch_missing: bool = True) -> list[dict[str, Any]]:
     """Fetch + cache body text for up to `max_fetch` catalyst-tagged, non-routine
     filings; set f['body_text'] and ADD any catalyst tags found in the body.
+
+    Body-derived tags are PERSISTED back to the filings table, so tag queries and
+    later cache-only passes (the dashboard) see them too. `fetch_missing=False`
+    uses only already-cached bodies — zero network, dashboard-snappy.
     """
     session = session or PoliteSession()
     targets = [f for f in filings if f.get("candidate_tags") and not f.get("is_routine")][:max_fetch]
     with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
-        results = list(pool.map(lambda x: (x, _body_for(session, x)), targets))
+        results = list(pool.map(lambda x: (x, _body_for(session, x, fetch_missing)), targets))
+    tag_updates: list[tuple[int, list[str]]] = []
     for f, text in results:
         f["body_text"] = text
         if text:
             merged = list(dict.fromkeys((f.get("candidate_tags") or []) + tag_keywords(text)))
+            if merged != f.get("candidate_tags") and f.get("id") is not None:
+                tag_updates.append((f["id"], merged))
             f["candidate_tags"] = merged
-    log.info("Filing-body enrich: %d filings read (cached or fetched)", len(targets))
+    store.set_filing_tags_bulk(tag_updates)
+    log.info("Filing-body enrich: %d filings read (%s), %d re-tagged from body",
+             len(targets), "cached+fetched" if fetch_missing else "cache-only", len(tag_updates))
     return filings

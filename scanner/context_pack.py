@@ -33,7 +33,10 @@ MAX_NOTE = 240
 MAX_FILINGS = 150          # cap the verbose filings list so the pack stays readable at 30-day / 5,000 scale
 
 # 8-K item codes that are concrete corporate events — always surfaced as PRIORITY.
-PRIORITY_8K_ITEMS = {"1.03": "bankruptcy/distress", "2.01": "M&A completed", "5.01": "control change"}
+# Includes the high-signal NEGATIVE events (delisting / restatement): distress is
+# also an asymmetric setup, and these are rare enough not to crowd the section.
+PRIORITY_8K_ITEMS = {"1.03": "bankruptcy/distress", "2.01": "M&A completed", "5.01": "control change",
+                     "3.01": "delisting notice", "4.02": "restatement/non-reliance"}
 
 # LUCRATIVE business-catalyst tags — the genuinely-asymmetric forward catalysts.
 # Deliberately EXCLUDES the broad 8-K-1.01 item tags (contract/material_agreement) and
@@ -117,9 +120,10 @@ def _label(cik: str, ticker: str, company: str, idx: dict[str, dict]) -> str:
 
 
 def _own_detail(o: dict[str, Any]) -> str:
-    """Shares @ price for a buy, else the stake %."""
+    """Shares @ price for a buy (price omitted when it didn't parse), else the stake %."""
     if o.get("side") == "BUY" and o.get("shares"):
-        return f"{o['shares']:,.0f} sh @ ${o.get('price')}"
+        return (f"{o['shares']:,.0f} sh @ ${o['price']}" if o.get("price")
+                else f"{o['shares']:,.0f} sh")
     if o.get("pct") is not None:
         return f"{o['pct']}% stake"
     return ""
@@ -153,9 +157,11 @@ def _build_priority(filings: list[dict[str, Any]], ownership: list[dict[str, Any
         "superinvestor_13f": [o for o in sup_all if (o.get("form_type") or "").startswith("13F")],
         "activist": [o for o in ownership if o.get("is_activist") and not o.get("matched_investor")],
         # Order insider buys by $ value so the LARGEST buy is never lost to the cap.
+        # When the price didn't parse, fall back to share count (price 1) instead of
+        # zeroing the buy to the bottom of the list.
         "insider_buys": sorted(
             [o for o in ownership if o.get("is_buy") and not o.get("matched_investor")],
-            key=lambda o: (o.get("shares") or 0) * (o.get("price") or 0), reverse=True),
+            key=lambda o: (o.get("shares") or 0) * (o.get("price") or 1), reverse=True),
         "corporate_events": _corporate_events(filings),
         # Business catalysts (contracts / capacity / FDA / partnerships / patents),
         # revealed by reading the filing body — the broad asymmetric-opportunity feed.
@@ -167,12 +173,14 @@ def _build_priority(filings: list[dict[str, Any]], ownership: list[dict[str, Any
 
 def build_context_pack(summary: dict[str, Any] | None = None,
                        since: datetime | None = None,
-                       enrich_bodies: bool = True) -> dict[str, Any]:
+                       enrich_bodies: bool = True,
+                       fetch_bodies: bool = True) -> dict[str, Any]:
     """Assemble + write the context pack. Returns paths and headline stats.
 
     `enrich_bodies` reads the primary document of catalyst-tagged filings (cached)
-    so an 8-K "Material Agreement" reveals WHAT the contract is. Set False to use
-    only already-cached bodies (the dashboard does this to stay snappy).
+    so an 8-K "Material Agreement" reveals WHAT the contract is. `fetch_bodies=False`
+    keeps the enrichment but uses only already-cached bodies — zero network (the
+    dashboard does this to stay snappy while still seeing body-derived catalysts).
     """
     summary = summary or run_prefilter(since=since)
     cand = summary["candidates"]
@@ -186,7 +194,8 @@ def build_context_pack(summary: dict[str, Any] | None = None,
 
     if enrich_bodies:
         from scanner import filing_body
-        filing_body.enrich(filings, max_fetch=200)   # reads bodies + re-tags on them
+        # reads bodies + re-tags on them (cache-only when fetch_bodies=False)
+        filing_body.enrich(filings, max_fetch=200, fetch_missing=fetch_bodies)
 
     news = cand["news"]
     tagged_news = [n for n in news if n.get("company_ciks")]
@@ -251,9 +260,15 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
     # --- PRIORITY SIGNALS (read FIRST; deterministic, window-size-independent) ---
     sup, act, buys, evts = (priority["superinvestor"], priority["activist"],
                             priority["insider_buys"], priority["corporate_events"])
-    out.append("## ⚡ PRIORITY SIGNALS — read first (highest-signal, never truncated)")
+    out.append("## ⚡ PRIORITY SIGNALS — read first (highest-signal; any overflow is "
+               "counted below, never silently lost)")
     if not (sup or act or buys or evts):
         out.append("_No priority signals in window._")
+
+    def _overflow(total: int, cap: int, kind: str) -> None:
+        if total > cap:
+            out.append(f"  … {total - cap} more {kind} in window not shown — "
+                       f"query the DB / dashboard for the rest.")
     for o in sup:   # superinvestor/watchlist hits (issuer-specific) — always shown in full
         out.append(f"[SUPERINVESTOR: {o.get('matched_investor')}] "
                    f"{_label(o.get('cik',''), o.get('ticker',''), o.get('company',''), idx)} — "
@@ -274,17 +289,20 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
             out.append(f"  → {o['detail']}")
         if o.get("filing_url"):
             out.append(f"  Source: {o['filing_url']}")
+    _overflow(len(act), 40, "activist 13D/13D-A rows")
     for o in buys[:25]:
         out.append(f"[INSIDER BUY] {_label(o.get('cik',''), o.get('ticker',''), o.get('company',''), idx)} — "
                    f"{o.get('filer_name','')} {_own_detail(o)} ({_et_short(o.get('filed_at'))})")
         if o.get("filing_url"):
             out.append(f"  Source: {o['filing_url']}")
+    _overflow(len(buys), 25, "insider buys (smallest by $ value)")
     for f, hits in evts[:25]:
         out.append(f"[CORP EVENT: {', '.join(hits)}] "
                    f"{_label(f.get('cik',''), f.get('ticker',''), f.get('company',''), idx)} — "
                    f"{f.get('form_type','')} ({_et_short(f.get('filed_at'))})")
         if f.get("filing_url"):
             out.append(f"  Source: {f['filing_url']}")
+    _overflow(len(evts), 25, "corporate-event 8-Ks")
     for f in priority.get("catalysts", [])[:30]:   # contracts / capacity / FDA / partnerships / patents
         tags = [t for t in (f.get("candidate_tags") or []) if t in CATALYST_TAGS]
         out.append(f"[CATALYST: {', '.join(tags)}] "
@@ -295,6 +313,7 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
             out.append(f"  → {snip}")
         if f.get("filing_url"):
             out.append(f"  Source: {f['filing_url']}")
+    _overflow(len(priority.get("catalysts", [])), 30, "business-catalyst filings")
     # External feeds (non-EDGAR): federal contracts, FDA/clinical, patents.
     _ext = priority.get("external", [])
     if _ext:
@@ -312,6 +331,7 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
                     out.append(f"  → {_short(e['detail'], 200)}")
                 if e.get("url"):
                     out.append(f"  Source: {e['url']}")
+            _overflow(len(_bycat.get(cat, [])), 20, f"{_labels.get(cat, cat)} items")
     out.append("")
     out.append("> NOTE: a 13D/A shows the CURRENT %, not whether the investor ADDED or TRIMMED — "
                "verify direction in the filing. Treat 13D and 13D/A equally as activist signals.")
@@ -352,11 +372,8 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
             flags.append("ACTIVIST-13D")
         if o.get("is_buy"):
             flags.append("INSIDER-BUY")
-        detail = ""
-        if o.get("side") == "BUY" and o.get("shares"):
-            detail = f" {o['shares']:,.0f} sh @ ${o.get('price')}"
-        elif o.get("pct") is not None:
-            detail = f" {o['pct']}% stake"
+        d = _own_detail(o)
+        detail = f" {d}" if d else ""
         out.append(f"[OWNERSHIP] {_label(cik, o.get('ticker',''), o.get('company',''), idx)} — "
                    f"{o.get('form_type','')} [{', '.join(flags)}]")
         out.append(f"  {o.get('filer_name','?')} ({o.get('relationship') or o.get('side','')}){detail}  "
@@ -365,17 +382,19 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
             out.append(f"  Source: {o['filing_url']}")
         out.append("")
 
-    # --- COMPANY NEWS (wires first, then news) ---
+    # --- COMPANY NEWS (wires first, then news; routine/noise items sort last) ---
     out.append("## NEWS (company-tagged — wires medium trust, news lower)")
     if not tagged_news:
         out.append("_None in window._")
-    tagged_news = sorted(tagged_news, key=lambda n: 0 if n.get("trust") == "wire" else 1)
+    tagged_news = sorted(tagged_news, key=lambda n: (0 if n.get("trust") == "wire" else 1,
+                                                     1 if n.get("is_noise") else 0))
     for n in tagged_news:
         syms = ", ".join(_co(c, idx).get("ticker", "?") for c in n.get("company_ciks", [])) or "?"
         tags = n.get("candidate_tags") or []
         tagstr = f"  | tags: [{', '.join(tags)}]" if tags else ""
         kind = "WIRE" if n.get("trust") == "wire" else "NEWS"
-        out.append(f"[{kind}] {syms} — {n.get('source','')} — {_et_short(n.get('published_at'))}{tagstr}")
+        noise = " [routine/noise]" if n.get("is_noise") else ""
+        out.append(f"[{kind}] {syms} — {n.get('source','')} — {_et_short(n.get('published_at'))}{tagstr}{noise}")
         out.append(f"  {_short(n.get('headline',''))}")
         if n.get("url"):
             out.append(f"  Source: {n['url']}")
@@ -456,6 +475,7 @@ def _render_json(summary, priority, filings, ownership, tagged_news, coverage, i
         "company_news": [{
             "tickers": [_co(c, idx).get("ticker", "?") for c in n.get("company_ciks", [])],
             "source": n.get("source"), "trust": n.get("trust"), "published_at": n.get("published_at"),
-            "candidate_tags": n.get("candidate_tags") or [], "headline": n.get("headline"), "url": n.get("url"),
+            "candidate_tags": n.get("candidate_tags") or [], "is_noise": bool(n.get("is_noise")),
+            "headline": n.get("headline"), "url": n.get("url"),
         } for n in tagged_news],
     }
