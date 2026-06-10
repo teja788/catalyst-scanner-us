@@ -38,6 +38,10 @@ opportunities**. The pack separates SEC FILINGS (highest trust) from OWNERSHIP
 (disclosed 13D/13G/Form 4), WIRE/PR, and NEWS (lower trust) — preserve that
 separation and never blur it.
 
+**Check the `Data freshness:` header line first** — if a source is marked STALE
+(>48h since its last successful refresh), say so explicitly instead of calling it a
+quiet day; an empty section then means "not fetched", not "nothing happened".
+
 **Always start with the `⚡ PRIORITY SIGNALS` section at the top of the pack.** It
 deterministically surfaces the highest-signal items — superinvestor/watchlist hits,
 activist stakes, insider buys, completed M&A / distress / control-change 8-Ks,
@@ -71,7 +75,10 @@ For each candidate, judge:
    insider buy, contract, M&A, offering), and how strong/durable.
 2. **Materiality relative to size** — is this big *for this company*? Use the
    market cap in the pack. A $200M order means more to a $2B company than a $2T one.
-   **Prioritise high materiality-to-size.**
+   **Prioritise high materiality-to-size.** Enriched filing lines carry a
+   deterministic `≈$N mentioned in body (~X% of mcap)` hint — a strong materiality
+   cue, but open the filing to verify what the number actually refers to (it can be
+   a financing amount, not a deal size).
 3. **Novelty / under-the-radar** — likely not yet widely noticed or priced in?
    **Use the COVERAGE count: prefer strong-catalyst + LOW-coverage names** — that's
    the asymmetric sweet spot. Down-rank the obvious mega-cap headline everyone sees.

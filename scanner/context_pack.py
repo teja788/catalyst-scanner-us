@@ -18,6 +18,7 @@ from __future__ import annotations
 import collections
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -64,7 +65,40 @@ def _is_comp_or_proxy(f: dict[str, Any]) -> bool:
             items = json.loads(items)
         except (ValueError, TypeError):
             items = []
-    return bool(items) and set(items) <= _COMP_GOV_ITEMS
+    # 9.01 (exhibits) rides along on almost every 8-K — ignore it, or a plain
+    # {5.02, 9.01} comp filing bypasses the filter (and its PR body can carry
+    # FDA/award keywords that would fake a business catalyst).
+    real = set(items) - {"9.01"}
+    return bool(real) and real <= _COMP_GOV_ITEMS
+
+
+# Dollar figures in filing bodies — the most objective materiality hint a filing
+# offers, and one phrase-keyword tagging completely ignores. Both spellings:
+# "$400 million" / "$1.2 billion" and fully-written "$36,000,000".
+_MONEY_WORD_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(million|billion)\b", re.I)
+_MONEY_DIGITS_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3}){2,})(?:\.\d+)?\b")
+
+
+def _max_body_amount(body: str) -> float | None:
+    """Largest dollar figure mentioned in the body (USD), or None."""
+    best = 0.0
+    for num, unit in _MONEY_WORD_RE.findall(body or ""):
+        best = max(best, float(num.replace(",", "")) * (1e9 if unit.lower() == "billion" else 1e6))
+    for num in _MONEY_DIGITS_RE.findall(body or ""):
+        best = max(best, float(num.replace(",", "")))
+    return best or None
+
+
+def _amount_note(body: str, mcap: float | None) -> str:
+    """'≈$36.0M mentioned in body (~5% of mcap)' — or '' when no figure found."""
+    amt = _max_body_amount(body)
+    if not amt:
+        return ""
+    note = f"≈{_fmt_usd(amt)} mentioned in body"
+    if mcap:
+        ratio = amt / mcap * 100
+        note += f" (~{ratio:.0f}% of mcap)" if ratio >= 1 else " (<1% of mcap)"
+    return note
 
 
 def _catalyst_snippet(body: str) -> str:
@@ -125,7 +159,12 @@ def _own_detail(o: dict[str, Any]) -> str:
         return (f"{o['shares']:,.0f} sh @ ${o['price']}" if o.get("price")
                 else f"{o['shares']:,.0f} sh")
     if o.get("pct") is not None:
-        return f"{o['pct']}% stake"
+        s = f"{o['pct']}% stake"
+        # Dropping below 5% on a 13D/A is often the FINAL amendment (an exit) —
+        # the rubric warns about this; flag it deterministically.
+        if o.get("form_type") == "SCHEDULE 13D/A" and o["pct"] < 5:
+            s += " (below 5% — possible exit)"
+        return s
     return ""
 
 
@@ -150,7 +189,25 @@ def _build_priority(filings: list[dict[str, Any]], ownership: list[dict[str, Any
     silently drops top signals like GameStop→eBay or Pershing Square→QSR.
     """
     sup_all = [o for o in ownership if o.get("matched_investor")]
+    # Multi-insider BUY clusters — several insiders buying the same name in one
+    # window is the classically strong form of the signal, and easy to miss when
+    # each Form 4 renders as its own line.
+    _by_cik: dict[str, list[dict[str, Any]]] = {}
+    for o in ownership:
+        if o.get("is_buy") and o.get("cik"):
+            _by_cik.setdefault(o["cik"], []).append(o)
+    clusters = []
+    for cik, rows in _by_cik.items():
+        buyers = {r.get("filer_name") for r in rows if r.get("filer_name")}
+        if len(buyers) >= 2:
+            clusters.append({
+                "cik": cik, "ticker": rows[0].get("ticker"), "company": rows[0].get("company"),
+                "n_insiders": len(buyers),
+                "usd": sum((r.get("shares") or 0) * (r.get("price") or 1) for r in rows),
+            })
+    clusters.sort(key=lambda c: c["usd"], reverse=True)
     return {
+        "buy_clusters": clusters,
         # issuer-specific superinvestor hits (13D / Form 4 — actionable, have a ticker)
         "superinvestor": [o for o in sup_all if not (o.get("form_type") or "").startswith("13F")],
         # portfolio 13F-HR by a watchlist manager (quarterly/lagged, no single issuer)
@@ -217,8 +274,9 @@ def build_context_pack(summary: dict[str, Any] | None = None,
     from scanner import store as _store
     _since_date = (summary.get("window_since") or "")[:10]
     priority["external"] = _store.get_recent_external_catalysts(_since_date) if _since_date else []
+    runs = _store.get_runs()   # per-source freshness for the pack header
 
-    md = _render_md(summary, priority, filings, ownership, tagged_news, market_news, coverage, idx)
+    md = _render_md(summary, priority, filings, ownership, tagged_news, market_news, coverage, idx, runs)
     pack_json = _render_json(summary, priority, filings, ownership, tagged_news, coverage, idx)
 
     md_path = resolve_path(settings.get("output", {}).get("context_pack", "runtime/context_pack.md"))
@@ -241,9 +299,11 @@ def build_context_pack(summary: dict[str, Any] | None = None,
     return stats
 
 
-def _render_md(summary, priority, filings, ownership, tagged_news, market_news, coverage, idx) -> str:
+def _render_md(summary, priority, filings, ownership, tagged_news, market_news, coverage, idx,
+               runs: dict[str, dict] | None = None) -> str:
     out: list[str] = []
-    now = datetime.now(_tz()).strftime("%Y-%m-%d %H:%M ET")
+    _now_dt = datetime.now(_tz())
+    now = _now_dt.strftime("%Y-%m-%d %H:%M ET")
     uni = load_settings().get("universe", {})
     out.append(f"# Context Pack — {now}")
     out.append(f"Window since: {_et_short(summary['window_since'])}  |  "
@@ -251,6 +311,27 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
     out.append(f"Counts: filings {len(filings)} (substantive {summary['filings_tagged']}), "
                f"ownership flagged {summary['ownership_flagged']}, "
                f"company news {len(tagged_news)}, market news {len(market_news)}")
+    # Per-source freshness, so an empty section reads as "not fetched" when that's
+    # the truth — not as a quiet day.
+    if runs:
+        parts, stale = [], []
+        for src in ("edgar", "news", "ownership", "external"):
+            last = (runs.get(src) or {}).get("last_success_at")
+            if not last:
+                parts.append(f"{src}: never")
+                stale.append(src)
+                continue
+            parts.append(f"{src}: {_et_short(last)}")
+            try:
+                age_h = (_now_dt - datetime.fromisoformat(last)).total_seconds() / 3600
+                if age_h > 48:
+                    stale.append(src)
+            except ValueError:
+                pass
+        out.append("Data freshness: " + "  ·  ".join(parts))
+        if stale:
+            out.append(f"> ⚠ STALE: {', '.join(stale)} last refreshed >48h ago (or never) — "
+                       "empty sections may mean 'not fetched', not 'quiet day'. Run `refresh` first.")
     out.append("")
     out.append("> Trust order: SEC FILING > OWNERSHIP (disclosed) > WIRE/PR > NEWS. "
                "Coverage = # news items on that ticker (LOW coverage + strong catalyst = asymmetric). "
@@ -290,6 +371,10 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
         if o.get("filing_url"):
             out.append(f"  Source: {o['filing_url']}")
     _overflow(len(act), 40, "activist 13D/13D-A rows")
+    for cl in priority.get("buy_clusters", [])[:10]:   # multi-insider buying, rolled up
+        out.append(f"[BUY CLUSTER] {_label(cl['cik'], cl.get('ticker', ''), cl.get('company', ''), idx)} — "
+                   f"{cl['n_insiders']} insiders bought ≈${cl['usd']:,.0f} combined in window")
+    _overflow(len(priority.get("buy_clusters", [])), 10, "buy clusters")
     for o in buys[:25]:
         out.append(f"[INSIDER BUY] {_label(o.get('cik',''), o.get('ticker',''), o.get('company',''), idx)} — "
                    f"{o.get('filer_name','')} {_own_detail(o)} ({_et_short(o.get('filed_at'))})")
@@ -311,6 +396,9 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
         snip = _catalyst_snippet(f.get("body_text") or "")
         if snip:
             out.append(f"  → {snip}")
+        note = _amount_note(f.get("body_text") or "", _co(f.get("cik", ""), idx).get("market_cap"))
+        if note:
+            out.append(f"  $ {note}")
         if f.get("filing_url"):
             out.append(f"  Source: {f['filing_url']}")
     _overflow(len(priority.get("catalysts", [])), 30, "business-catalyst filings")
@@ -347,9 +435,11 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
         routine = " [routine]" if f.get("is_routine") else ""
         tagstr = f"  | tags: [{', '.join(tags)}]" if tags else ""
         cov = coverage.get(cik, 0)
+        note = _amount_note(f.get("body_text") or "", _co(cik, idx).get("market_cap"))
+        notestr = f"  | {note}" if note else ""
         out.append(f"[SEC FILING] {_label(cik, f.get('ticker',''), f.get('company',''), idx)} — "
                    f"{f.get('form_type','')} — {_et_short(f.get('filed_at'))}{routine}")
-        out.append(f"  {f.get('headline','')}{tagstr}  | coverage: {cov}")
+        out.append(f"  {f.get('headline','')}{tagstr}{notestr}  | coverage: {cov}")
         if f.get("filing_url"):
             out.append(f"  Source: {f['filing_url']}")
         out.append("")
@@ -435,6 +525,7 @@ def _render_json(summary, priority, filings, ownership, tagged_news, coverage, i
             "superinvestor": [_own_json(o, idx) for o in priority["superinvestor"]],
             "superinvestor_13f": sorted({o.get("matched_investor") for o in priority["superinvestor_13f"] if o.get("matched_investor")}),
             "activist": [_own_json(o, idx) for o in priority["activist"][:60]],
+            "buy_clusters": priority.get("buy_clusters", [])[:20],
             "insider_buys": [_own_json(o, idx) for o in priority["insider_buys"][:40]],
             "corporate_events": [{
                 "ticker": f.get("ticker"), "company": f.get("company"), "cik": f.get("cik"),
@@ -448,6 +539,7 @@ def _render_json(summary, priority, filings, ownership, tagged_news, coverage, i
                 "form_type": f.get("form_type"),
                 "tags": [t for t in (f.get("candidate_tags") or []) if t in CATALYST_TAGS],
                 "snippet": _catalyst_snippet(f.get("body_text") or ""),
+                "body_amount": _max_body_amount(f.get("body_text") or ""),
                 "filed_at": f.get("filed_at"), "source": f.get("filing_url"),
             } for f in priority["catalysts"][:60]],
             "external": [{
@@ -462,6 +554,7 @@ def _render_json(summary, priority, filings, ownership, tagged_news, coverage, i
             "market_cap": _co(f.get("cik", ""), idx).get("market_cap"),
             "form_type": f.get("form_type"), "item_codes": f.get("item_codes") or [],
             "candidate_tags": f.get("candidate_tags") or [], "is_routine": bool(f.get("is_routine")),
+            "body_amount": _max_body_amount(f.get("body_text") or ""),
             "headline": f.get("headline"), "filed_at": f.get("filed_at"),
             "coverage": coverage.get(f.get("cik", ""), 0), "source": f.get("filing_url"),
         } for f in filings],

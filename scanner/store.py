@@ -365,6 +365,18 @@ def counts(conn: sqlite3.Connection | None = None) -> dict[str, int]:
             conn.close()
 
 
+def get_runs(conn: sqlite3.Connection | None = None) -> dict[str, dict[str, Any]]:
+    """source -> last run row. Feeds the pack's data-freshness header, so the
+    agent can tell 'quiet day' apart from 'nothing fetched lately'."""
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        return {r["source"]: dict(r) for r in conn.execute("SELECT * FROM runs").fetchall()}
+    finally:
+        if own:
+            conn.close()
+
+
 def coverage(conn: sqlite3.Connection | None = None) -> dict[str, dict[str, Any]]:
     """Stored count + date range per source, so the UI knows what it already has."""
     own = conn is None

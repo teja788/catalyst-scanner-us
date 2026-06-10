@@ -440,9 +440,10 @@ def schedule(install: bool = typer.Option(False, "--install", help="Actually cre
             title="Windows Task Scheduler", border_style="cyan"))
 
     console.print(
-        f"\n[bold]Timezone note (you're on IST):[/bold] tasks run on LOCAL machine time. The evening "
-        f"catch-up at [bold]{evening} IST[/bold] ≈ 4:30pm ET the previous day — i.e. just after the US "
-        "market close, when the day's filings have landed.\n"
+        f"\n[bold]Timezone note (you're on IST):[/bold] tasks run on LOCAL machine time. The daily "
+        f"catch-up at [bold]{evening} IST[/bold] ≈ 10:30–11:30pm ET the previous day — after EDGAR's "
+        "~10pm ET acceptance cutoff, so the FULL day's filings (including the dense 4–6pm ET "
+        "after-market 8-K wave) have landed.\n"
         "[bold yellow]Laptop-only caveat:[/bold yellow] coverage = \"whenever the laptop is on and the task ran.\" "
         "Because [bold]scan[/bold]/[bold]refresh[/bold] always catch up since the last successful run, opening "
         "the tool at any random time still pulls everything since then — you never miss filings to a sleep.")

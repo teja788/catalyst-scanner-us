@@ -42,8 +42,11 @@ output:
 scoring:
   mode: agent               # "agent" (live, default) | "llm_api" (future stub, scoring/llm_scorer.py)
 
-# Windows Task Scheduler (M11). Times are LOCAL machine time. Since you run on IST,
-# the evening catch-up after the US close (4:30pm ET) maps to ~02:00 IST next day.
+# Windows Task Scheduler (M11). Times are LOCAL machine time (you run on IST).
+# NOTE: EDGAR accepts filings until ~10pm ET, and the densest 8-K wave is
+# 4–6pm ET *after* the close — so the daily catch-up must run AFTER ~10pm ET.
+# 09:00 IST = 22:30 ET (winter) / 23:30 ET (summer): the WHOLE day has landed.
+# (The old 02:00 IST = 4:30pm ET ran BEFORE the after-hours wave.)
 schedule:
   refresh_every_min: 45
-  evening_catchup_local: "02:00"    # ~4:30pm ET previous day (US-close catch-up), in IST
+  evening_catchup_local: "09:00"    # ≈10:30-11:30pm ET previous day — full-day catch-up, in IST
