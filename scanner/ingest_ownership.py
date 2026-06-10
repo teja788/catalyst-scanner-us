@@ -167,33 +167,39 @@ def _parse_form4(text: str) -> dict[str, Any]:
     if _flag(doc, "isTenPercentOwner"):
         rel.append("10% owner")
 
-    blocks = re.findall(r"<(?:nonDerivative|derivative)Transaction>(.*?)</(?:nonDerivative|derivative)Transaction>",
-                        doc, re.S)
+    # ONLY the non-derivative table can evidence an open-market BUY. Code P also
+    # appears on DERIVATIVE rows (e.g. warrants "acquired" under an employment
+    # agreement — pure compensation), and the old any-table scan flagged those as
+    # insider buys (ABAT CEO's comp warrants showed as an "$8.3M buy"). A real buy
+    # is a PRICED non-derivative P; the price must come from the buy legs, not
+    # from a same-form tax-withholding sale.
+    blocks = re.findall(r"<nonDerivativeTransaction>(.*?)</nonDerivativeTransaction>", doc, re.S)
     codes: list[str] = []
     buy_sh = sell_sh = 0.0
-    price: float | None = None
+    buy_px = sell_px = None
     for b in blocks:
         code = _tag(b, "transactionCode") or ""
         sh = _num(_val(b, "transactionShares"))
         pr = _num(_val(b, "transactionPricePerShare"))
         if code:
             codes.append(code)
-        if code == "P" and sh:
+        if code == "P" and sh and pr:
             buy_sh += sh
+            buy_px = max(buy_px or 0.0, pr)
         elif code == "S" and sh:
             sell_sh += sh
-        if pr and (price is None or pr > price):
-            price = pr
+            if pr:
+                sell_px = max(sell_px or 0.0, pr)
 
-    side = "BUY" if "P" in codes else ("SELL" if "S" in codes else "OTHER")
+    side = "BUY" if buy_sh else ("SELL" if sell_sh else "OTHER")
     shares = buy_sh if side == "BUY" else (sell_sh if side == "SELL" else None)
     return {
         "filer_name": owner,
         "relationship": ", ".join(rel),
         "side": side,
         "shares": shares or None,
-        "price": price,
-        "is_buy": "P" in codes,
+        "price": buy_px if side == "BUY" else sell_px,
+        "is_buy": bool(buy_sh),
     }
 
 
