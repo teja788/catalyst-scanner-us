@@ -77,8 +77,13 @@ For each candidate, judge:
    market cap in the pack. A $200M order means more to a $2B company than a $2T one.
    **Prioritise high materiality-to-size.** Enriched filing lines carry a
    deterministic `≈$N mentioned in body (~X% of mcap)` hint — a strong materiality
-   cue, but open the filing to verify what the number actually refers to (it can be
-   a financing amount, not a deal size).
+   cue, but it is the LARGEST figure anywhere in the body, which is often a
+   HISTORICAL amount recited as background (8-Ks restate old deal terms), or a
+   financing amount. Before citing a magnitude, read the item's OPENING sentences —
+   that's where the NEW event lives — and confirm the figure's DATE belongs to the
+   new event, not to a transaction that already closed. (Learned the hard way:
+   a "$220M" body mention was an Aug-2025 closing; the actual June-2026 event was
+   a $4M final holdback receipt.)
 3. **Novelty / under-the-radar** — likely not yet widely noticed or priced in?
    **Use the COVERAGE count: prefer strong-catalyst + LOW-coverage names** — that's
    the asymmetric sweet spot. Down-rank the obvious mega-cap headline everyone sees.
