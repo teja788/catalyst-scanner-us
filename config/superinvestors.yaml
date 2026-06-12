@@ -1,6 +1,7 @@
 # Marquee funds / activist investors to FLAG (not endorse) when their name appears
-# as the filer on a 13D/13G or Form 4 (public record). Matching is case-insensitive
-# substring against the disclosed filer name. Edit freely.
+# as the filer on a 13D/13G or Form 4 (public record). Matching is case-insensitive:
+# EVERY word of an entry must appear in the disclosed filer name (any order, since
+# EDGAR lists people surname-first, e.g. "LOEB DANIEL S"). Edit freely.
 #
 # 13F-derived signals are quarterly/lagged (filed ~45 days after quarter-end), so
 # they are marked clearly as a SLOW signal — not a "last 24h" alert.
@@ -27,16 +28,18 @@ investors:
   - Duquesne Family Office      # Stanley Druckenmiller
   - Himalaya Capital            # Li Lu
 
-  # Principal NAMES too — marquee investors often file personally (surname-first
+  # Principal FULL NAMES too — marquee investors often file personally (surname-first
   # in EDGAR, e.g. "ICAHN CARL C", "ACKMAN WILLIAM A"), which the fund names above
-  # would miss. Only distinctive surnames (low false-positive risk).
-  - Icahn                       # Carl Icahn (personal + Icahn Capital)
-  - Buffett                     # Warren Buffett
-  - Ackman                      # Bill Ackman
-  - Burry                       # Michael Burry
-  - Einhorn                     # David Einhorn
-  - Loeb                        # Dan Loeb
-  - Peltz                       # Nelson Peltz
-  - Tepper                      # David Tepper
-  - Klarman                     # Seth Klarman
-  - Druckenmiller               # Stanley Druckenmiller
+  # would miss. Use FULL names, never bare surnames: a surname alone false-positives
+  # on unrelated insiders who share it (seen live: "LOEB GARY", an ISRG insider,
+  # was tagged as Dan Loeb).
+  - Carl Icahn                  # personal Form 4s + Icahn Capital
+  - Warren Buffett
+  - William Ackman              # Bill Ackman
+  - Michael Burry
+  - David Einhorn
+  - Daniel Loeb                 # Dan Loeb
+  - Nelson Peltz
+  - David Tepper
+  - Seth Klarman
+  - Stanley Druckenmiller

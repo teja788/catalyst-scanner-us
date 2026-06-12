@@ -198,12 +198,23 @@ def _build_priority(filings: list[dict[str, Any]], ownership: list[dict[str, Any
             _by_cik.setdefault(o["cik"], []).append(o)
     clusters = []
     for cik, rows in _by_cik.items():
-        buyers = {r.get("filer_name") for r in rows if r.get("filer_name")}
+        # Related co-filers each file their OWN Form 4 for the SAME purchase (e.g.
+        # two General Atlantic entities reporting one 1.3M-share LFTO buy, which
+        # doubled the cluster to "2 insiders ≈$60M"). Dedupe identical trades —
+        # same (trade date, shares, price) — before counting buyers / summing
+        # dollars; the per-filer insider_buys rows stay untouched (both real).
+        # Legacy rows without trade_date carry None on every co-filed copy, so
+        # the pair still collapses.
+        uniq: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+        for r in rows:
+            uniq.setdefault((r.get("trade_date"), r.get("shares"), r.get("price")), r)
+        deduped = list(uniq.values())
+        buyers = {r.get("filer_name") for r in deduped if r.get("filer_name")}
         if len(buyers) >= 2:
             clusters.append({
                 "cik": cik, "ticker": rows[0].get("ticker"), "company": rows[0].get("company"),
                 "n_insiders": len(buyers),
-                "usd": sum((r.get("shares") or 0) * (r.get("price") or 1) for r in rows),
+                "usd": sum((r.get("shares") or 0) * (r.get("price") or 1) for r in deduped),
             })
     clusters.sort(key=lambda c: c["usd"], reverse=True)
     return {

@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS ownership (
     side             TEXT,          -- BUY | SELL | STAKE | 13F | OTHER
     shares           REAL,
     price            REAL,
+    trade_date       TEXT,          -- Form-4 buy-leg transaction date (cluster dedupe key)
     pct              REAL,
     matched_investor TEXT,
     is_insider       INTEGER,
@@ -174,11 +175,13 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
     conn = conn or get_conn()
     try:
         conn.executescript(_SCHEMA)
-        # Lightweight migration for DBs created before `detail` existed.
-        try:
-            conn.execute("ALTER TABLE ownership ADD COLUMN detail TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Lightweight migrations for DBs created before these columns existed.
+        for ddl in ("ALTER TABLE ownership ADD COLUMN detail TEXT",
+                    "ALTER TABLE ownership ADD COLUMN trade_date TEXT"):
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
     finally:
         if own:
@@ -273,9 +276,9 @@ def upsert_ownership(items: list[dict[str, Any]], conn: sqlite3.Connection | Non
     conn = conn or get_conn()
     try:
         cols = ["cik", "ticker", "company", "filer_name", "relationship", "form_type",
-                "side", "shares", "price", "pct", "matched_investor", "is_insider",
-                "is_buy", "is_activist", "detail", "filing_url", "accession", "filed_at",
-                "ingested_at", "dedupe_hash"]
+                "side", "shares", "price", "trade_date", "pct", "matched_investor",
+                "is_insider", "is_buy", "is_activist", "detail", "filing_url",
+                "accession", "filed_at", "ingested_at", "dedupe_hash"]
         prepared = []
         for it in items:
             r = dict(it)
