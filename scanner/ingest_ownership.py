@@ -17,8 +17,9 @@ Indexing facts verified live (2026-06):
 
 Each matched filing is fetched once as its full-submission .txt, which contains
 both the SGML header (FILED BY, acceptance time) and the embedded ownership XML
-(transaction codes). Superinvestor matching is a case-insensitive substring of
-the filer/owner name against config/superinvestors.yaml.
+(transaction codes). Superinvestor matching is case-insensitive against the
+filer/owner name: every word of a config/superinvestors.yaml entry must appear
+(any order — EDGAR lists people surname-first).
 
 NOTE: Form 3/5 (initial/annual) are skipped for now (lower signal); 13F holdings
 are flagged at the filing level (the full holdings->universe diff via CUSIP is a
@@ -75,13 +76,19 @@ def _superinvestors() -> list[str]:
 
 
 def _match_investor(name: str, watchlist: list[str]) -> str | None:
-    """Word-boundary match of a filer/owner name to the watchlist, so a surname
-    like 'Ackman' does NOT match inside 'Jackman Worthing'."""
+    """Match a filer/owner name to the watchlist: EVERY word of an entry must
+    appear word-bounded in the name, in ANY order — EDGAR lists people
+    surname-first ('LOEB DANIEL S'), so a full-name entry 'Daniel Loeb' still
+    matches. A bare surname shared by an unrelated insider must NOT match
+    (seen live: 'LOEB GARY', an ISRG insider, tagged as Dan Loeb), and a word
+    never matches inside a longer one ('Ackman' vs 'Jackman Worthing')."""
     if not name:
         return None
     low = name.lower()
     for inv in watchlist:
-        if re.search(rf"(?<![a-z0-9]){re.escape(inv.lower())}(?![a-z0-9])", low):
+        words = inv.lower().split()
+        if words and all(re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", low)
+                         for w in words):
             return inv
     return None
 
@@ -177,6 +184,7 @@ def _parse_form4(text: str) -> dict[str, Any]:
     codes: list[str] = []
     buy_sh = sell_sh = 0.0
     buy_px = sell_px = None
+    buy_date = None
     for b in blocks:
         code = _tag(b, "transactionCode") or ""
         sh = _num(_val(b, "transactionShares"))
@@ -186,6 +194,10 @@ def _parse_form4(text: str) -> dict[str, Any]:
         if code == "P" and sh and pr:
             buy_sh += sh
             buy_px = max(buy_px or 0.0, pr)
+            # Trade date of the buy leg: related co-filers (e.g. two General
+            # Atlantic funds) each file a Form 4 for the SAME purchase; the pack
+            # dedupes cluster math on (trade_date, shares, price).
+            buy_date = buy_date or _val(b, "transactionDate")
         elif code == "S" and sh:
             sell_sh += sh
             if pr:
@@ -199,6 +211,7 @@ def _parse_form4(text: str) -> dict[str, Any]:
         "side": side,
         "shares": shares or None,
         "price": buy_px if side == "BUY" else sell_px,
+        "trade_date": buy_date if side == "BUY" else None,
         "is_buy": bool(buy_sh),
     }
 

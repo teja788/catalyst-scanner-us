@@ -15,3 +15,6 @@ streamlit>=1.40         # web dashboard (dashboard.py)
 # never required by the core scanner). Install to enable Claude / OpenAI answers.
 anthropic>=0.40
 openai>=1.50
+
+# Dev / test only
+pytest>=8.0             # regression tests (tests/)
