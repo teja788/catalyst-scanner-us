@@ -156,19 +156,14 @@ with st.sidebar:
 # --------------------------------------------------------------------------- #
 # Header + pack
 # --------------------------------------------------------------------------- #
-st.title("📡 catalyst-scanner-us")
-st.caption("Asymmetric-opportunity scanner for the top US-listed companies "
-           "(SEC EDGAR filings + 13D/13G/Form-4 ownership + wires/news). "
-           "Research leads only — **not investment advice**.")
-
 stats, pack, md = _build_pack(total_h, st.session_state["data_version"])
 
-m = st.columns(5)
-m[0].metric("Window", f"{total_h}h")
-m[1].metric("SEC filings", f"{stats['filings']}", f"{stats['filings_substantive']} substantive")
-m[2].metric("Ownership (flagged)", stats["ownership_flagged"])
-m[3].metric("Company news", stats["company_news"])
-m[4].metric("Market news", stats["market_news"])
+st.caption(
+    f"📡 **catalyst-scanner-us** — research leads only, **not investment advice** &nbsp;·&nbsp; "
+    f"Window {total_h}h · SEC filings {stats['filings']} ({stats['filings_substantive']} substantive) · "
+    f"Ownership flagged {stats['ownership_flagged']} · Company news {stats['company_news']} · "
+    f"Market news {stats['market_news']}"
+)
 
 tab_sig, tab_fil, tab_own, tab_log, tab_chat = st.tabs(
     ["⚡ Signals", "📄 Filings", "🏛 Ownership", "📝 Research log", "💬 Chat"])
