@@ -108,3 +108,5 @@ _Research only, not investment advice._
 **Noise / data notes:** DLHC's "contract_win" tag was a credit-agreement amendment (keyword false positive); CTMX's $4B is the historical 2022 Regeneron collab (Amendment No. 4 is the event); FIGR's body-amount is a parsing artifact — ignore; HZO $950M = refinancing; JEF 424B5 structured notes false-tag `index_inclusion`; Icahn/IEP = self-filings; Trian/JHG 16.65%→0% is the completed Janus merger payout, not an exit signal.
 
 _Research only, not investment advice._
+
+<!-- pages-redeploy-retry -->
