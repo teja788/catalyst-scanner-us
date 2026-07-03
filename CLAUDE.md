@@ -166,6 +166,23 @@ Then:
 
 Keep SEC FILINGS visually separate from NEWS, and always include the source link.
 
+### ALWAYS save the analysis (last step, not optional)
+
+After presenting the ranked analysis, persist the SAME content to the research log
+so it survives the session (deduped by key — re-saving is a no-op):
+
+```python
+from scanner import research_log
+research_log.save(content_md,
+                  title="<N>-day scan analysis (<window>)",
+                  key="<YYYY-MM-DD>|<N>d|agent-scan")   # today's date | window | source
+```
+
+The log is `digests/research_log.md` (append-only, human-readable, gitignored).
+Include in the saved content: the window, the pack build time, the data-freshness
+caveats, every lead with its source link, the Watch section, and any noise notes —
+the log entry must stand alone without the chat transcript.
+
 ### Follow-up questions about a company
 
 Query the SQLite store (`run.bat ask "<company>"`, add `--fetch` for a fresh targeted
