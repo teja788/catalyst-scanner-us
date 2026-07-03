@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title | default: site.title }}</title>
+  {% if site.description %}<meta name="description" content="{{ site.description }}">{% endif %}
+  <style>
+    :root {
+      --bg:#f7f8fa; --surface:#ffffff; --ink:#1c2530; --ink-soft:#55606d; --ink-faint:#8a949f;
+      --line:#e4e8ee; --line-strong:#d2d8e0; --accent:#0d7a6e; --accent-soft:#e4f2f0;
+      --hi:#b0402a; --hi-bg:#f7e7e2; --med:#b07d17; --med-bg:#f6edd7; --low:#5a6472; --low-bg:#eceef2;
+      --mono:ui-monospace,"SF Mono","SFMono-Regular","Cascadia Mono","Roboto Mono",Menlo,Consolas,monospace;
+      --sans:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg:#0f1319; --surface:#161c24; --ink:#e6ebf1; --ink-soft:#a8b2be; --ink-faint:#6d7885;
+        --line:#262e39; --line-strong:#333d4a; --accent:#3fb9a9; --accent-soft:#12352f;
+        --hi:#e0836c; --hi-bg:#38211a; --med:#d6ac52; --med-bg:#352c15; --low:#9aa5b3; --low-bg:#21272f;
+      }
+    }
+    * { box-sizing:border-box; }
+    html,body { margin:0; }
+    body { background:var(--bg); color:var(--ink); font-family:var(--sans); font-size:16px; line-height:1.6; }
+    .page { padding:0 24px 80px; }
+
+    /* ---- Header: JUST the title ---- */
+    header.site {
+      max-width:820px; margin:0 auto; padding:28px 0 18px;
+      border-bottom:2px solid var(--accent);
+      display:flex; align-items:baseline; gap:12px; flex-wrap:wrap;
+    }
+    header.site .dot {
+      width:10px; height:10px; border-radius:50%; background:var(--accent);
+      flex:none; align-self:center; box-shadow:0 0 0 4px var(--accent-soft);
+    }
+    header.site h1 { margin:0; font-size:22px; font-weight:700; letter-spacing:-0.01em; color:var(--ink); }
+
+    main.log { max-width:820px; margin:0 auto; }
+
+    /* Publish stamp + "Research log" intro from the markdown */
+    main.log > h1 {
+      font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.08em;
+      color:var(--ink-faint); margin:18px 0 2px;
+    }
+    main.log > p em, main.log > blockquote { color:var(--ink-soft); font-size:13px; }
+    main.log > p:first-of-type { margin-top:14px; }
+
+    main.log h2 {
+      font-size:19px; font-weight:650; letter-spacing:-0.01em; color:var(--ink);
+      margin:30px 0 6px; padding-top:8px;
+    }
+    main.log hr { border:0; border-top:1px solid var(--line); margin:8px 0 16px; }
+
+    /* meta + caveat paragraphs (classed by JS; degrade to plain text otherwise) */
+    main.log p { margin:10px 0; }
+    main.log p.meta { font-size:13px; color:var(--ink-soft); margin:6px 0; }
+    main.log p.caveat {
+      font-size:13px; color:var(--ink-soft); background:var(--low-bg);
+      border-left:3px solid var(--line-strong); padding:10px 14px; border-radius:0 6px 6px 0; margin:12px 0 18px;
+    }
+    main.log p.caveat strong { color:var(--ink); }
+    main.log p.sectioned {
+      font-family:var(--mono); font-size:13px; color:var(--ink-soft);
+      background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:12px 14px;
+    }
+    main.log p.sectioned strong {
+      display:block; font-size:11px; text-transform:uppercase; letter-spacing:0.07em;
+      color:var(--ink-faint); margin-bottom:4px; font-weight:600;
+    }
+
+    /* ---- Leads: each top-level <ol><li> is a card ---- */
+    main.log ol { list-style:none; counter-reset:lead; padding:0; margin:14px 0; display:flex; flex-direction:column; gap:14px; }
+    main.log ol > li {
+      counter-increment:lead; position:relative;
+      background:var(--surface); border:1px solid var(--line); border-radius:10px;
+      padding:16px 18px 14px 20px;
+    }
+    main.log ol > li::before {
+      content:counter(lead); font-family:var(--mono); font-size:12px; font-weight:600; color:var(--accent);
+      position:absolute; top:16px; left:-20px; width:16px; text-align:right;
+    }
+    @media (max-width:560px) { main.log ol > li::before { position:static; margin-right:6px; } }
+
+    /* header line of a lead (JS wraps ticker/company; plain bold as fallback) */
+    main.log ol > li > strong:first-child { display:block; margin-bottom:8px; font-size:15px; }
+    main.log .lead-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    main.log .ticker {
+      font-family:var(--mono); font-weight:700; font-size:15px; color:var(--ink);
+      background:var(--accent-soft); padding:2px 8px; border-radius:5px;
+    }
+    main.log .co { font-size:14px; color:var(--ink-soft); font-weight:400; }
+    main.log .badge {
+      margin-left:auto; font-family:var(--mono); font-size:10px; font-weight:600;
+      text-transform:uppercase; letter-spacing:0.06em; padding:3px 9px; border-radius:20px; white-space:nowrap;
+    }
+    main.log .badge.high { color:var(--hi); background:var(--hi-bg); }
+    main.log .badge.med { color:var(--med); background:var(--med-bg); }
+    main.log .badge.low { color:var(--low); background:var(--low-bg); }
+
+    /* the What / Why / Trust / Source bullets inside a lead */
+    main.log ol > li ul { list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:6px; }
+    main.log ol > li ul li { font-size:14.5px; color:var(--ink); }
+    main.log ol > li ul li strong:first-child {
+      font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:0.04em;
+      color:var(--ink-faint); font-weight:600; margin-right:6px;
+    }
+
+    main.log a { color:var(--accent); text-decoration:none; word-break:break-word; }
+    main.log a:hover, main.log a:focus { text-decoration:underline; }
+    main.log a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:2px; }
+    main.log strong { color:var(--ink); font-weight:650; }
+    main.log code {
+      font-family:var(--mono); font-size:0.88em; background:var(--low-bg);
+      padding:1px 5px; border-radius:4px; color:var(--ink);
+    }
+
+    footer.note {
+      max-width:820px; margin:26px auto 0; font-size:12px; color:var(--ink-faint); font-family:var(--mono);
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="site">
+      <span class="dot" aria-hidden="true"></span>
+      <h1>{{ page.title | default: site.title }}</h1>
+    </header>
+    <main class="log">
+      {{ content }}
+    </main>
+    <footer class="note">digests/research_log.md · published to GitHub Pages on request</footer>
+  </div>
+
+  <script>
+  (function () {
+    function esc(s){ var d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
+    try {
+      var root = document.querySelector("main.log");
+      if (!root) return;
+
+      // Each top-level ordered-list item is a lead card: split the header line
+      // into a ticker chip + company, and lift the conviction into a badge.
+      root.querySelectorAll("ol > li").forEach(function (li) {
+        var head = li.querySelector(":scope > strong");
+        if (head) {
+          var txt = head.textContent, dash = txt.indexOf("—"); // em dash
+          if (dash > 0) {
+            head.classList.add("lead-head");
+            head.innerHTML = '<span class="ticker">' + esc(txt.slice(0, dash).trim()) +
+                             '</span><span class="co">' + esc(txt.slice(dash + 1).trim()) + "</span>";
+          }
+        }
+        var conviction = null;
+        li.querySelectorAll("ul li").forEach(function (sub) {
+          var m = /Conviction:\s*(High|Medium|Low)/i.exec(sub.textContent);
+          if (m && !conviction) conviction = m[1];
+        });
+        if (conviction && head && head.classList.contains("lead-head")) {
+          var b = document.createElement("span");
+          var k = conviction.toLowerCase();
+          b.className = "badge " + (k === "high" ? "high" : k === "medium" ? "med" : "low");
+          b.textContent = conviction;
+          head.appendChild(b);
+        }
+      });
+
+      // Tag meta / caveat / section paragraphs by their leading bold label.
+      root.querySelectorAll("p > strong:first-child").forEach(function (s) {
+        var t = s.textContent.trim().toLowerCase(), p = s.parentNode;
+        if (/caveat|freshness|coverage/.test(t)) p.classList.add("caveat");
+        else if (/^window/.test(t)) p.classList.add("meta");
+        else if (/^watch|^noise|^not flagged|^data notes/.test(t)) p.classList.add("sectioned");
+      });
+    } catch (e) { /* progressive enhancement only */ }
+  })();
+  </script>
+</body>
+</html>
