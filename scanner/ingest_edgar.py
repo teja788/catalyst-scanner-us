@@ -111,7 +111,16 @@ _IDX_CACHE_MAX = 40
 
 
 def fetch_daily_index(session: PoliteSession, d: date) -> list[dict[str, Any]]:
-    """Return parsed rows for one filing day, or [] if no index (weekend/holiday)."""
+    """Return parsed rows for one filing day, or [] if no index (weekend/holiday).
+
+    Failure discipline (the silent-data-loss guard): a MISSING index (weekend /
+    holiday) is a 403/404 whose body is S3's "AccessDenied" XML (verified live
+    2026-07 — SEC serves 403, not 404, for absent .idx files). ANY other failure
+    — a fair-access block ("Undeclared Automated Tool" HTML, also a 403), an
+    exhausted 429/5xx retry, a network error — RAISES, so the refresh marks the
+    source failed and the catch-up cursor does NOT advance past a day that was
+    never actually fetched.
+    """
     import requests
 
     if d in _IDX_CACHE:
@@ -123,15 +132,25 @@ def fetch_daily_index(session: PoliteSession, d: date) -> list[dict[str, Any]]:
     try:
         text = session.edgar_get(url, timeout=45).text
     except requests.HTTPError as exc:
-        code = getattr(exc.response, "status_code", None)
-        if code not in (403, 404):
-            log.warning("daily index %s -> %s", url, exc)
-        rows: list[dict[str, Any]] = []   # 403/404 = non-trading day: no filings
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+        body = ""
+        if resp is not None:
+            try:
+                body = resp.text[:1000]
+            except Exception:  # noqa: BLE001 - body only informs classification
+                body = ""
+        if code == 404 or (code == 403 and "AccessDenied" in body):
+            rows: list[dict[str, Any]] = []   # genuinely no index = non-trading day
+        else:
+            # 403 block page / exhausted 429/5xx: NOT a quiet day — fail the run.
+            log.warning("daily index %s -> %s (treating as fetch failure, not a holiday)", url, exc)
+            raise
     else:
         rows = _parse_idx(text)
     if d < _now().date():               # never cache today's still-growing index
         if len(_IDX_CACHE) >= _IDX_CACHE_MAX:
-            _IDX_CACHE.clear()
+            _IDX_CACHE.pop(next(iter(_IDX_CACHE)))   # evict oldest, not everything
         _IDX_CACHE[d] = rows
     return rows
 
@@ -194,7 +213,12 @@ def _to_et_iso(acceptance: str, fallback_date: str) -> str:
     try:
         return datetime.strptime(fallback_date, "%Y%m%d").replace(tzinfo=_et()).isoformat()
     except ValueError:
-        return fallback_date
+        # Never store a raw non-ISO string: "20260615" sorts AFTER every ISO
+        # timestamp lexicographically, so such a row would appear in EVERY window
+        # forever. An empty filed_at keeps the row queryable by CIK but out of
+        # time-window scans.
+        log.warning("unparseable filing date %r — storing empty filed_at", fallback_date)
+        return ""
 
 
 def _item_codes(items_str: str) -> list[str]:

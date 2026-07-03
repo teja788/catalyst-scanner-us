@@ -79,7 +79,15 @@ def _parse_money(val: Any) -> float | None:
 # Alias generation (for tagging news headlines to companies in Milestone 4)
 # --------------------------------------------------------------------------- #
 def make_aliases(company: str, symbol: str) -> list[str]:
-    """Produce a few distinct lower-cased aliases for news matching."""
+    """Produce a few distinct lower-cased NAME aliases for news matching.
+
+    Deliberately does NOT include the ticker: tickers get their own uppercase-only
+    matching tier (with a stopword list) in the news Tagger, and adding them here
+    caused ordinary capitalised English words to tag companies — "Well-Being" →
+    Welltower (WELL), "Open" → Opendoor (OPEN), "Team" → Atlassian (TEAM) — which
+    polluted ~9% of tagged news and inflated the coverage counter (verified live
+    2026-07). Consumers that want ticker matching add it themselves, guarded.
+    """
     aliases: set[str] = set()
     if company:
         cleaned = _PUNCT.sub(" ", company.lower())
@@ -89,8 +97,6 @@ def make_aliases(company: str, symbol: str) -> list[str]:
         core = " ".join(tokens)
         if len(core) >= 3:
             aliases.add(core)
-    if symbol:
-        aliases.add(symbol.lower())
     return sorted(a for a in aliases if len(a) >= 3)
 
 

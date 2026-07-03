@@ -132,7 +132,9 @@ def _acceptance_iso(text: str, fallback_date: str) -> str:
     try:
         return datetime.strptime(fallback_date, "%Y%m%d").replace(tzinfo=_et()).isoformat()
     except ValueError:
-        return fallback_date
+        # Raw "YYYYMMDD" sorts after every ISO string — would match every window.
+        log.warning("unparseable ownership date %r — storing empty filed_at", fallback_date)
+        return ""
 
 
 def _subject_cik_int(text: str, form: str) -> int | None:
@@ -182,8 +184,7 @@ def _parse_form4(text: str) -> dict[str, Any]:
     # from a same-form tax-withholding sale.
     blocks = re.findall(r"<nonDerivativeTransaction>(.*?)</nonDerivativeTransaction>", doc, re.S)
     codes: list[str] = []
-    buy_sh = sell_sh = 0.0
-    buy_px = sell_px = None
+    buy_sh = sell_sh = buy_val = sell_val = 0.0
     buy_date = None
     for b in blocks:
         code = _tag(b, "transactionCode") or ""
@@ -193,7 +194,7 @@ def _parse_form4(text: str) -> dict[str, Any]:
             codes.append(code)
         if code == "P" and sh and pr:
             buy_sh += sh
-            buy_px = max(buy_px or 0.0, pr)
+            buy_val += sh * pr
             # Trade date of the buy leg: related co-filers (e.g. two General
             # Atlantic funds) each file a Form 4 for the SAME purchase; the pack
             # dedupes cluster math on (trade_date, shares, price).
@@ -201,10 +202,17 @@ def _parse_form4(text: str) -> dict[str, Any]:
         elif code == "S" and sh:
             sell_sh += sh
             if pr:
-                sell_px = max(sell_px or 0.0, pr)
+                sell_val += sh * pr
 
+    # Share-weighted average price across legs (a multi-leg buy at $10/$20 is
+    # NOT a "$20 buy" — the old max() overstated the spend).
+    buy_px = round(buy_val / buy_sh, 4) if buy_sh else None
+    sell_px = round(sell_val / sell_sh, 4) if sell_val else None
     side = "BUY" if buy_sh else ("SELL" if sell_sh else "OTHER")
     shares = buy_sh if side == "BUY" else (sell_sh if side == "SELL" else None)
+    # 10b5-1 pre-planned trades are mechanically scheduled — far weaker signal
+    # than a discretionary open-market buy. The document-level checkbox marks it.
+    planned = _flag(doc, "aff10b5One")
     return {
         "filer_name": owner,
         "relationship": ", ".join(rel),
@@ -213,6 +221,8 @@ def _parse_form4(text: str) -> dict[str, Any]:
         "price": buy_px if side == "BUY" else sell_px,
         "trade_date": buy_date if side == "BUY" else None,
         "is_buy": bool(buy_sh),
+        "detail": ("10b5-1 PLANNED transaction (pre-scheduled — weaker signal)"
+                   if planned else ("discretionary open-market buy" if buy_sh else "")),
     }
 
 
@@ -358,8 +368,8 @@ def ingest(session: PoliteSession | None = None,
             return None   # filer-side row of a filing about a non-universe company
         is_13d = r["form"].startswith("SCHEDULE 13D")
         if r["form"].startswith("4"):
-            p = _parse_form4(text)
-            rec = {**p, "form_type": r["form"], "is_insider": 1, "is_activist": 0, "detail": ""}
+            p = _parse_form4(text)   # carries its own `detail` (10b5-1 / discretionary)
+            rec = {**p, "form_type": r["form"], "is_insider": 1, "is_activist": 0}
         else:  # SCHEDULE 13D / 13G
             p = _parse_sc13(text)
             # Self-filing (filer CIK == subject CIK) is a treasury/subsidiary 13D, not

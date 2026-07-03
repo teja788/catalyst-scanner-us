@@ -95,45 +95,60 @@ def _base(m: dict[str, Any]) -> dict[str, Any]:
 # Feed 1 — federal contract awards (USAspending.gov, no key)
 # --------------------------------------------------------------------------- #
 def fetch_contracts(session: PoliteSession, start: str, end: str,
-                    idx: dict[str, dict[str, Any]], limit: int = 200) -> list[dict[str, Any]]:
+                    idx: dict[str, dict[str, Any]], pages: int = 5,
+                    page_size: int = 100) -> list[dict[str, Any]]:
     # date_type new_awards_only is essential: the default matches awards with ANY
     # action in the window, and "Award Amount" is cumulative-to-date — verified live
     # to surface a 1993 Lockheed DOE contract ($48B) on a routine modification.
-    payload = {
-        "filters": {"award_type_codes": ["A", "B", "C", "D"],
+    #
+    # TWO sort passes, paginated: a single top-100-by-amount page structurally
+    # excludes the asymmetric sweet spot — a $40M award that is huge for a $300M-cap
+    # company never outranks the Lockheed-class mega-primes. The by-amount pass
+    # keeps the mega awards; the by-recency pass reaches the smaller new awards.
+    base_filters = {"award_type_codes": ["A", "B", "C", "D"],
                     "time_period": [{"start_date": start, "end_date": end,
-                                     "date_type": "new_awards_only"}]},
-        "fields": ["Award ID", "Recipient Name", "Award Amount", "Awarding Agency", "Description", "Start Date"],
-        "limit": min(limit, 100), "page": 1, "sort": "Award Amount", "order": "desc",
-    }
+                                     "date_type": "new_awards_only"}]}
+    fields = ["Award ID", "Recipient Name", "Award Amount", "Awarding Agency", "Description", "Start Date"]
     out: list[dict[str, Any]] = []
-    try:
-        r = session.post("https://api.usaspending.gov/api/v2/search/spending_by_award/",
-                         json=payload, timeout=45,
-                         headers={"User-Agent": _ua(), "Accept": "application/json"})
-        results = r.json().get("results", [])
-    except Exception as exc:  # noqa: BLE001
-        log.warning("USAspending fetch failed: %s", exc)
-        return []
-    for a in results:
-        m = match_org(a.get("Recipient Name", ""), idx)
-        if not m:
-            continue
-        amt = a.get("Award Amount")
-        # the award PAGE needs the generated id (snake_case key, returned
-        # automatically) — a bare PIID ("Award ID") does not resolve.
-        aid = a.get("generated_internal_id") or a.get("Award ID") or ""
-        agency = a.get("Awarding Agency") or ""
-        pop = a.get("Start Date") or ""
-        out.append({**_base(m), "source": "USAspending", "category": "contract",
-                    "headline": (f"Federal contract ${amt:,.0f} — {agency}" if amt else f"Federal contract — {agency}"),
-                    "detail": ((a.get("Description") or "")[:280] + (f" (PoP start {pop})" if pop else "")), "amount": amt,
-                    "url": f"https://www.usaspending.gov/award/{aid}",
-                    "event_date": pop or end,   # new_awards_only: Start Date ~ award date
-                    "dedupe_hash": _hash("usasp", a.get("Award ID") or aid, m["cik"])})
-    if len(results) >= payload["limit"]:
-        log.info("USAspending: window returned >=%d awards — smallest new awards may be cut "
-                 "by the top-by-amount page", payload["limit"])
+    seen_ids: set[str] = set()
+    for sort_field in ("Award Amount", "Start Date"):
+        for page in range(1, pages + 1):
+            payload = {"filters": base_filters, "fields": fields,
+                       "limit": page_size, "page": page, "sort": sort_field, "order": "desc"}
+            try:
+                r = session.post("https://api.usaspending.gov/api/v2/search/spending_by_award/",
+                                 json=payload, timeout=45,
+                                 headers={"User-Agent": _ua(), "Accept": "application/json"})
+                js = r.json()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("USAspending fetch failed (sort=%s page %d): %s", sort_field, page, exc)
+                break
+            results = js.get("results", [])
+            for a in results:
+                key = str(a.get("generated_internal_id") or a.get("Award ID") or "")
+                if not key or key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                m = match_org(a.get("Recipient Name", ""), idx)
+                if not m:
+                    continue
+                amt = a.get("Award Amount")
+                # the award PAGE needs the generated id (snake_case key, returned
+                # automatically) — a bare PIID ("Award ID") does not resolve.
+                aid = a.get("generated_internal_id") or a.get("Award ID") or ""
+                agency = a.get("Awarding Agency") or ""
+                pop = a.get("Start Date") or ""
+                out.append({**_base(m), "source": "USAspending", "category": "contract",
+                            "headline": (f"Federal contract ${amt:,.0f} — {agency}" if amt else f"Federal contract — {agency}"),
+                            "detail": ((a.get("Description") or "")[:280] + (f" (PoP start {pop})" if pop else "")), "amount": amt,
+                            "url": f"https://www.usaspending.gov/award/{aid}",
+                            "event_date": pop or end,   # new_awards_only: Start Date ~ award date
+                            "dedupe_hash": _hash("usasp", a.get("Award ID") or aid, m["cik"])})
+            if len(results) < page_size or not (js.get("page_metadata") or {}).get("hasNext"):
+                break
+        else:
+            log.info("USAspending: %s pass exhausted %d pages — deeper awards in window not sampled",
+                     sort_field, pages)
     return out
 
 
@@ -180,29 +195,38 @@ def fetch_fda(session: PoliteSession, start: str, end: str,
     except Exception as exc:  # noqa: BLE001 - openFDA 404s an empty result set
         log.warning("openFDA fetch failed (404 = no approvals in window): %s", exc)
     # 2b. ClinicalTrials.gov v2 — Phase-3 studies whose RESULTS were posted in the
-    # window. Keying on lastUpdatePostDate alone surfaced stale trials bumped by
-    # admin record edits; results-posted is the actual readout event.
+    # window. Filter SERVER-SIDE on ResultsFirstPostDate (verified live 2026-07):
+    # the old client-side filter over the top-100 most-recently-UPDATED studies
+    # silently missed any readout not among the 100 latest record edits.
     try:
-        r = session.get("https://clinicaltrials.gov/api/v2/studies", headers=hdr, timeout=30, params={
-            "filter.advanced": "AREA[Phase]PHASE3", "aggFilters": "results:with",
-            "sort": "LastUpdatePostDate:desc", "pageSize": 100})
-        for st in r.json().get("studies", []):
-            ps = st.get("protocolSection", {})
-            spon = (((ps.get("sponsorCollaboratorsModule") or {}).get("leadSponsor") or {}).get("name") or "")
-            m = match_org(spon, idx)
-            if not m:
-                continue
-            ident = ps.get("identificationModule") or {}
-            status = ps.get("statusModule") or {}
-            posted = ((status.get("resultsFirstPostDateStruct") or {}).get("date") or "")
-            if not posted or posted < start or posted > end:   # results must land in window
-                continue
-            nct = ident.get("nctId", "")
-            out.append({**_base(m), "source": "ClinicalTrials", "category": "fda",
-                        "headline": f"Phase 3 results posted: {(ident.get('briefTitle') or '')[:90]}",
-                        "detail": f"{spon} — {nct}", "amount": None,
-                        "url": f"https://clinicaltrials.gov/study/{nct}",
-                        "event_date": posted, "dedupe_hash": _hash("ctgov", nct, m["cik"])})
+        params: dict[str, Any] = {
+            "filter.advanced": f"AREA[Phase]PHASE3 AND AREA[ResultsFirstPostDate]RANGE[{start},{end}]",
+            "aggFilters": "results:with", "pageSize": 100}
+        for _page in range(5):   # up to 500 readouts per window — far above reality
+            r = session.get("https://clinicaltrials.gov/api/v2/studies", headers=hdr,
+                            timeout=30, params=params)
+            js = r.json()
+            for st in js.get("studies", []):
+                ps = st.get("protocolSection", {})
+                spon = (((ps.get("sponsorCollaboratorsModule") or {}).get("leadSponsor") or {}).get("name") or "")
+                m = match_org(spon, idx)
+                if not m:
+                    continue
+                ident = ps.get("identificationModule") or {}
+                status = ps.get("statusModule") or {}
+                posted = ((status.get("resultsFirstPostDateStruct") or {}).get("date") or "")
+                if not posted or posted < start or posted > end:   # belt-and-braces
+                    continue
+                nct = ident.get("nctId", "")
+                out.append({**_base(m), "source": "ClinicalTrials", "category": "fda",
+                            "headline": f"Phase 3 results posted: {(ident.get('briefTitle') or '')[:90]}",
+                            "detail": f"{spon} — {nct}", "amount": None,
+                            "url": f"https://clinicaltrials.gov/study/{nct}",
+                            "event_date": posted, "dedupe_hash": _hash("ctgov", nct, m["cik"])})
+            token = js.get("nextPageToken")
+            if not token:
+                break
+            params["pageToken"] = token
     except Exception as exc:  # noqa: BLE001
         log.warning("ClinicalTrials fetch failed: %s", exc)
     return out

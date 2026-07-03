@@ -42,6 +42,14 @@ output:
 scoring:
   mode: agent               # "agent" (live, default) | "llm_api" (future stub, scoring/llm_scorer.py)
 
+# ---- Signal-quality knobs (context pack) ----
+signals:
+  insider_buy_min_usd: 25000       # PRIORITY-list floor for lone insider buys (unpriced buys kept;
+                                   # every buy still appears in the OWNERSHIP section)
+  price_reaction: true             # fetch daily closes (Yahoo chart API, free/no key) for priority
+                                   # tickers and print "px … % since event" — the priced-in check
+  price_reaction_max_tickers: 50
+
 # Windows Task Scheduler (M11). Times are LOCAL machine time (you run on IST).
 # NOTE: EDGAR accepts filings until ~10pm ET, and the densest 8-K wave is
 # 4–6pm ET *after* the close — so the daily catch-up must run AFTER ~10pm ET.

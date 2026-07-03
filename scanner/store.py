@@ -540,6 +540,66 @@ def news_for_ciks(ciks: list[str], limit: int = 50, since_iso: str | None = None
             conn.close()
 
 
+# --- ownership history lookups (deterministic direction / novelty signals) --- #
+def prior_stake_pct(cik: str, filer_name: str, before_iso: str,
+                    conn: sqlite3.Connection | None = None) -> float | None:
+    """Latest disclosed pct by this filer on this issuer BEFORE `before_iso`.
+
+    Lets the pack compute 13D/A direction (ADDED/TRIMMED) from our own stored
+    history instead of regex-guessing it from Item 5(c) prose. Exact filer-name
+    match: EDGAR conformed names are stable across amendments."""
+    if not (cik and filer_name):
+        return None
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        row = conn.execute(
+            "SELECT pct FROM ownership WHERE cik=? AND filer_name=? AND pct IS NOT NULL "
+            "AND form_type LIKE 'SCHEDULE 13%' AND filed_at < ? AND filed_at != '' "
+            "ORDER BY filed_at DESC LIMIT 1", (cik, filer_name, before_iso)).fetchone()
+        return row["pct"] if row else None
+    finally:
+        if own:
+            conn.close()
+
+
+def prior_13g_exists(cik: str, filer_name: str, before_iso: str,
+                     conn: sqlite3.Connection | None = None) -> bool:
+    """True if this filer previously disclosed a PASSIVE 13G on this issuer —
+    a 13G→13D switch is one of the strongest activist-intent signals there is."""
+    if not (cik and filer_name):
+        return False
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM ownership WHERE cik=? AND filer_name=? "
+            "AND form_type LIKE 'SCHEDULE 13G%' AND filed_at < ? LIMIT 1",
+            (cik, filer_name, before_iso)).fetchone()
+        return row is not None
+    finally:
+        if own:
+            conn.close()
+
+
+def prior_buy_exists(cik: str, filer_name: str, before_iso: str,
+                     conn: sqlite3.Connection | None = None) -> bool:
+    """True if this insider has an earlier stored open-market BUY on this issuer.
+    (History depth = what's in the DB, so 'first stored buy' is labelled as such.)"""
+    if not (cik and filer_name):
+        return True   # can't establish novelty — don't claim it
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM ownership WHERE cik=? AND filer_name=? AND is_buy=1 "
+            "AND filed_at < ? LIMIT 1", (cik, filer_name, before_iso)).fetchone()
+        return row is not None
+    finally:
+        if own:
+            conn.close()
+
+
 # --- filing body-text cache (M8) ------------------------------------------- #
 def get_filing_text(ref_hash: str, conn: sqlite3.Connection | None = None) -> dict[str, Any] | None:
     own = conn is None
@@ -591,6 +651,18 @@ def get_watchlist(conn: sqlite3.Connection | None = None) -> list[dict[str, Any]
     conn = conn or get_conn()
     try:
         return _rows(conn, "SELECT * FROM watchlist ORDER BY added_at DESC", ())
+    finally:
+        if own:
+            conn.close()
+
+
+def remove_from_watchlist(cik: str, conn: sqlite3.Connection | None = None) -> bool:
+    own = conn is None
+    conn = conn or get_conn()
+    try:
+        cur = conn.execute("DELETE FROM watchlist WHERE cik=?", (cik,))
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         if own:
             conn.close()

@@ -264,10 +264,11 @@ def scan(skip_refresh: bool = typer.Option(False, "--skip-refresh",
         console.print(f"[dim]Catch-up refresh{note}...[/dim]")
         _render_refresh(_refresh_all(since_override=since))
     else:
-        console.print(f"[dim]--skip-refresh: using stored data{note}.[/dim]")
+        console.print(f"[dim]--skip-refresh: using stored data{note} (cached bodies only — no network).[/dim]")
 
     with console.status("[cyan]Pre-filtering + assembling context pack..."):
-        stats = build_context_pack(since=since)
+        # --skip-refresh promises "no fetching": use only cached bodies/prices.
+        stats = build_context_pack(since=since, fetch_bodies=not skip_refresh)
 
     table = Table(title="Context pack assembled", border_style="green")
     table.add_column("Section")
@@ -293,7 +294,10 @@ def _resolve_companies(question: str, universe: list[dict]) -> list[dict]:
         if c["cik"] in seen:
             continue
         tk = (c.get("ticker") or "").upper()
-        cands = list(c.get("aliases", []))
+        # Old universe files carry the ticker inside aliases too — strip it there
+        # so the stopword guard below can't be bypassed ("any news FOR NVDA" must
+        # not resolve Forestar (FOR) via its 'for' alias).
+        cands = [a for a in c.get("aliases", []) if a != tk.lower()]
         if tk and tk not in TICKER_STOPWORDS:
             cands.append(tk.lower())
         for cand in cands:
@@ -374,6 +378,48 @@ def ask(question: str = typer.Argument(..., help="A question naming a company / 
                    store.ownership_for_ciks(ciks, since_iso=since_iso))
     else:
         console.print("[yellow]No company recognised. Name a ticker (e.g. 'NVDA') or company.[/yellow]")
+
+
+@app.command()
+def watch(action: str = typer.Argument(..., help="add | remove | list"),
+          ticker: str = typer.Argument(None, help="Ticker (for add/remove)."),
+          note: str = typer.Option("", "--note", help="Why it's on the watchlist.")) -> None:
+    """Manage the watchlist. Watched tickers float to the TOP of the context pack
+    (a ★ WATCHLIST section above even the superinvestor hits)."""
+    from scanner import store
+    from scanner.universe import _norm, load_map
+
+    store.init_db()
+    action = action.lower()
+    if action == "list":
+        rows = store.get_watchlist()
+        if not rows:
+            console.print("[dim]Watchlist is empty. Add with: run.bat watch add NVDA --note \"...\"[/dim]")
+            return
+        table = Table(title="Watchlist", border_style="cyan")
+        table.add_column("Ticker")
+        table.add_column("CIK")
+        table.add_column("Added")
+        table.add_column("Note")
+        for w in rows:
+            table.add_row(w.get("ticker") or "?", w["cik"], (w.get("added_at") or "")[:10], w.get("note") or "")
+        console.print(table)
+        return
+    if not ticker:
+        raise typer.BadParameter("watch add/remove needs a ticker.")
+    hit = next((c for c in load_map() if _norm(c.get("ticker", "")) == _norm(ticker)), None)
+    if hit is None:
+        console.print(f"[yellow]{ticker!r} not found in the universe map.[/yellow]")
+        raise typer.Exit(1)
+    if action == "add":
+        store.add_to_watchlist(hit["cik"], hit.get("ticker", ""), note)
+        console.print(f"[green]★ Watching {hit['ticker']} ({hit.get('name','')}).[/green]")
+    elif action == "remove":
+        gone = store.remove_from_watchlist(hit["cik"])
+        console.print(f"[green]Removed {hit['ticker']}.[/green]" if gone
+                      else f"[yellow]{hit['ticker']} was not on the watchlist.[/yellow]")
+    else:
+        raise typer.BadParameter("action must be add, remove, or list.")
 
 
 @app.command()

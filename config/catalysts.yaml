@@ -90,15 +90,19 @@ keywords:
     - public offering
     - private placement
     - convertible notes
-  guidance:
+  guidance:                     # a genuine FORWARD guidance change only
     - raises guidance
     - raised guidance
+    - raising guidance
+    - raises outlook
     - lifts outlook
-    - record revenue
-    - record quarter
+    - raises full-year
+    - guidance increase
+  earnings_strength:            # backward-looking good-quarter language. NOT in the
+    - record revenue            # lucrative CATALYST bucket (it flooded it with routine
+    - record quarter            # 2.02 earnings 8-Ks) — still tagged for the agent.
     - beats estimates
     - preliminary results
-    - guidance increase
   index_inclusion:
     # NOTE: keep these SPECIFIC — a bare "added to the" used to false-tag every
     # "added to the Board of Directors" 8-K as an index-inclusion catalyst.

@@ -134,15 +134,24 @@ with st.sidebar:
 
     # Gap-only backfill when the window reaches before stored filings.
     if f["earliest"] and since.isoformat() < f["earliest"]:
-        if st.button("⤓ Backfill filings to window", help="Fetches ONLY the missing older gap"):
-            from scanner import ingest_edgar
+        if st.button("⤓ Backfill filings to window",
+                     help="Fetches ONLY the missing older gap (filings + 13D/13G stakes; "
+                          "skips the heavy Form-4 sweep)"):
+            from scanner import ingest_edgar, ingest_ownership
             from scanner.http import PoliteSession
             gap_until = datetime.fromisoformat(f["earliest"])
+            session = PoliteSession()
             with st.spinner(f"Backfilling filings {since.date()} → {gap_until.date()}..."):
-                items = ingest_edgar.ingest(session=PoliteSession(), since=since, until=gap_until)
+                items = ingest_edgar.ingest(session=session, since=since, until=gap_until)
                 added = store.upsert_filings(items)
+                # 13D/13G for the same gap — otherwise old windows show filings
+                # with no activist context. Form 4s stay excluded (25k+ fetches).
+                own_items = ingest_ownership.ingest(
+                    session=session, since=since, until=gap_until,
+                    forms={"SCHEDULE 13D", "SCHEDULE 13D/A", "SCHEDULE 13G", "SCHEDULE 13G/A"})
+                own_added = store.upsert_ownership(own_items)
             _bump()
-            st.success(f"Backfilled {added} older filings.")
+            st.success(f"Backfilled {added} older filings + {own_added} 13D/13G rows.")
 
 # --------------------------------------------------------------------------- #
 # Header + pack

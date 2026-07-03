@@ -19,7 +19,10 @@ investors:
   - Starboard Value             # (activist)
   - ValueAct Capital
   - Trian Partners              # Nelson Peltz
+  - Trian Fund Management       # Peltz's actual EDGAR filing entity ("TRIAN FUND MANAGEMENT, L.P.")
   - Icahn Enterprises           # Carl Icahn
+  - Icahn Capital               # Icahn's fund entity ("ICAHN CAPITAL LP") — matches neither
+                                # "Icahn Enterprises" nor "Carl Icahn" without this line
   - Baupost Group               # Seth Klarman
   - Greenlight Capital          # David Einhorn
   - Appaloosa                   # David Tepper

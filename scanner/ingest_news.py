@@ -81,6 +81,12 @@ class Tagger:
             if len(ticker) >= 2 and ticker not in TICKER_STOPWORDS:
                 ticker_map.setdefault(ticker, cik)
             for alias in c.get("aliases", []):
+                # Ticker-as-alias (present in universe files built before 2026-07):
+                # tickers belong ONLY to the uppercase tier below — as a lowercase
+                # alias they'd match capitalised sentence-start English words
+                # ("Well", "Open", "Next") and false-tag ~9% of news.
+                if alias == ticker.lower():
+                    continue
                 if alias in ALIAS_STOPWORDS:
                     # the short alias is too generic ("target"), but the FULL formal
                     # name ("target corporation") is still distinctive — keep that path
