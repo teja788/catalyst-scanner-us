@@ -183,6 +183,11 @@ Include in the saved content: the window, the pack build time, the data-freshnes
 caveats, every lead with its source link, the Watch section, and any noise notes —
 the log entry must stand alone without the chat transcript.
 
+To publish the log to its GitHub Pages view, run `run.bat publish-log` (or use the
+dashboard's 📝 tab button) — it copies the log to `docs/index.md` and pushes only
+that file. **The published page is PUBLIC** — publishing stays a deliberate,
+user-triggered act; never auto-publish as part of saving.
+
 ### Follow-up questions about a company
 
 Query the SQLite store (`run.bat ask "<company>"`, add `--fetch` for a fresh targeted

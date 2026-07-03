@@ -1,0 +1,7 @@
+# GitHub Pages (Jekyll) config for the published research log.
+# Pages source: Settings -> Pages -> "Deploy from a branch" -> main /docs.
+theme: jekyll-theme-minimal
+title: catalyst-scanner-us — research log
+description: >-
+  Dated, sourced research leads from the catalyst scanner.
+  Research only — not investment advice.

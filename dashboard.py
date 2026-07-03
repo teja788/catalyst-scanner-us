@@ -170,8 +170,8 @@ m[2].metric("Ownership (flagged)", stats["ownership_flagged"])
 m[3].metric("Company news", stats["company_news"])
 m[4].metric("Market news", stats["market_news"])
 
-tab_sig, tab_fil, tab_own, tab_chat = st.tabs(
-    ["⚡ Signals", "📄 Filings", "🏛 Ownership", "💬 Chat"])
+tab_sig, tab_fil, tab_own, tab_log, tab_chat = st.tabs(
+    ["⚡ Signals", "📄 Filings", "🏛 Ownership", "📝 Research log", "💬 Chat"])
 
 # --------------------------------------------------------------------------- #
 # Signals
@@ -266,6 +266,32 @@ with tab_own:
         "Buy": bool(d.get("is_buy")), "Activist": bool(d.get("is_activist")),
         "Superinvestor": d.get("matched_investor"),
     } for d in own], width="stretch", hide_index=True)
+
+# --------------------------------------------------------------------------- #
+# Research log (local view + explicit publish to GitHub Pages)
+# --------------------------------------------------------------------------- #
+with tab_log:
+    from scanner.publish_log import pages_url, publish
+    from scanner.research_log import LOG_PATH
+
+    cols = st.columns([3, 1])
+    cols[0].caption(f"Local log: `{LOG_PATH}` — saved analyses, deduped, private until published.")
+    if cols[1].button("🌐 Publish to GitHub Pages",
+                      help="Copies the log to docs/index.md and pushes ONLY that file. "
+                           "The published page is PUBLIC."):
+        try:
+            r = publish(push=True)
+            st.success(f"{r['status']} → {r['url'] or r['page']}")
+        except Exception as exc:  # noqa: BLE001 - show the real git/IO error
+            st.error(f"Publish failed: {exc}")
+    if pages_url():
+        st.caption(f"Published page (once Pages is enabled): {pages_url()}")
+    if LOG_PATH.exists():
+        st.markdown(LOG_PATH.read_text(encoding="utf-8"))
+    else:
+        st.info("No research log yet — run a scan analysis (it saves here automatically), "
+                "or use the ⚡ Signals tab's AI rank.")
+
 
 # --------------------------------------------------------------------------- #
 # Chat

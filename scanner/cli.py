@@ -422,6 +422,27 @@ def watch(action: str = typer.Argument(..., help="add | remove | list"),
         raise typer.BadParameter("action must be add, remove, or list.")
 
 
+@app.command(name="publish-log")
+def publish_log_cmd(no_push: bool = typer.Option(False, "--no-push",
+                    help="Write docs/index.md but do NOT git commit/push it.")) -> None:
+    """Publish the local research log to GitHub Pages (docs/index.md).
+
+    The raw log stays private/local; this copies it to the Pages source and
+    pushes ONLY that file. The published page is PUBLIC — publish deliberately.
+    """
+    from scanner.publish_log import publish
+
+    try:
+        r = publish(push=not no_push)
+    except (FileNotFoundError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]{r['status']}[/green] → {r['page']}")
+    if r["url"]:
+        console.print(f"[bold]Page:[/bold] {r['url']} [dim](public; first deploy takes ~1 min. "
+                      "One-time setup: repo Settings → Pages → Deploy from branch → main /docs)[/dim]")
+
+
 @app.command()
 def digest(hours: int = _HOURS_OPT, days: int = _DAYS_OPT) -> None:
     """Build the context pack and save a dated markdown digest to digests/.
