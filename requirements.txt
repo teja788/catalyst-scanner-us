@@ -8,7 +8,6 @@ python-dateutil>=2.8
 tzdata>=2024.1          # Windows has no IANA tz DB; zoneinfo needs this for America/New_York
 rich>=13.0
 typer>=0.12
-yfinance>=0.2.40        # free market-cap fallback (M2) + future price/quote adapter (M12)
 streamlit>=1.40         # web dashboard (dashboard.py)
 
 # Optional — only needed for the dashboard's AI rank/chat panels (lazy-imported,

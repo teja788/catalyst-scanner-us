@@ -55,9 +55,11 @@ def _build_pack(total_h: int, version: int):
     fresh `since` timestamp would change every rerun and defeat the cache, so the
     instant is computed in here. `version` bumps when data changes. Bodies come
     from the filing_text cache only (zero network), so body-derived catalyst tags
-    still reach the dashboard pack."""
+    still reach the dashboard pack. Written to its OWN file — never over the
+    runtime/context_pack.md that a CLI `scan` wrote for the agent."""
     since = _now() - timedelta(hours=total_h)
-    stats = build_context_pack(since=since, enrich_bodies=True, fetch_bodies=False)
+    stats = build_context_pack(since=since, enrich_bodies=True, fetch_bodies=False,
+                               out_path="runtime/dashboard_pack.md")
     with open(stats["json_path"], encoding="utf-8") as fh:
         pack = json.load(fh)
     with open(stats["md_path"], encoding="utf-8") as fh:
@@ -91,7 +93,8 @@ with st.sidebar:
                    "Launch via the desktop icon (not from a Claude Code terminal).")
     else:
         provider = "claude" if engine.startswith("Claude") else "openai"
-        default_model = "claude-opus-4-8" if provider == "claude" else "gpt-5.5"
+        from scanner.scoring.llm_scorer import DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL
+        default_model = DEFAULT_CLAUDE_MODEL if provider == "claude" else DEFAULT_OPENAI_MODEL
         model = st.text_input("Model", value=default_model, key=f"model_{provider}")
         api_key = st.text_input("API key", type="password",
                                 help="Held in session memory only; never written to disk.")
@@ -141,17 +144,22 @@ with st.sidebar:
             from scanner.http import PoliteSession
             gap_until = datetime.fromisoformat(f["earliest"])
             session = PoliteSession()
+            f_stats, o_stats = {}, {}
             with st.spinner(f"Backfilling filings {since.date()} → {gap_until.date()}..."):
-                items = ingest_edgar.ingest(session=session, since=since, until=gap_until)
+                items = ingest_edgar.ingest(session=session, since=since, until=gap_until, stats=f_stats)
                 added = store.upsert_filings(items)
                 # 13D/13G for the same gap — otherwise old windows show filings
                 # with no activist context. Form 4s stay excluded (25k+ fetches).
                 own_items = ingest_ownership.ingest(
-                    session=session, since=since, until=gap_until,
+                    session=session, since=since, until=gap_until, stats=o_stats,
                     forms={"SCHEDULE 13D", "SCHEDULE 13D/A", "SCHEDULE 13G", "SCHEDULE 13G/A"})
                 own_added = store.upsert_ownership(own_items)
             _bump()
             st.success(f"Backfilled {added} older filings + {own_added} 13D/13G rows.")
+            lost = f_stats.get("failed", 0) + o_stats.get("failed", 0)
+            if lost:
+                st.warning(f"{lost} filings failed to fetch — retry with "
+                           f"`run.bat refresh --days {max(1, (_now() - since).days + 1)}`.")
 
 # --------------------------------------------------------------------------- #
 # Header + pack

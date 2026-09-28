@@ -453,12 +453,19 @@ def filings_by_tag(tag: str, limit: int = 50, since_iso: str | None = None,
             conn.close()
 
 
-def set_filing_tags(filing_id: int, tags: list[str], conn: sqlite3.Connection | None = None) -> None:
+def existing_hashes(table: str, hashes: list[str],
+                    conn: sqlite3.Connection | None = None) -> set[str]:
+    """The subset of `hashes` already stored in `table` — lets ingesters skip
+    re-fetching documents that INSERT OR IGNORE would discard anyway."""
     own = conn is None
     conn = conn or get_conn()
     try:
-        conn.execute("UPDATE filings SET candidate_tags=? WHERE id=?", (json.dumps(tags), filing_id))
-        conn.commit()
+        found: set[str] = set()
+        for i in range(0, len(hashes), 900):          # SQLite parameter limit
+            chunk = hashes[i:i + 900]
+            found |= {r[0] for r in conn.execute(
+                f"SELECT dedupe_hash FROM {table} WHERE dedupe_hash IN ({_placeholders(len(chunk))})", chunk)}
+        return found
     finally:
         if own:
             conn.close()
@@ -601,12 +608,18 @@ def prior_buy_exists(cik: str, filer_name: str, before_iso: str,
 
 
 # --- filing body-text cache (M8) ------------------------------------------- #
-def get_filing_text(ref_hash: str, conn: sqlite3.Connection | None = None) -> dict[str, Any] | None:
+def get_filing_texts(ref_hashes: list[str], conn: sqlite3.Connection | None = None) -> dict[str, str]:
+    """{ref_hash: text} for the cached, non-empty bodies among `ref_hashes`."""
     own = conn is None
     conn = conn or get_conn()
     try:
-        row = conn.execute("SELECT * FROM filing_text WHERE ref_hash=?", (ref_hash,)).fetchone()
-        return dict(row) if row else None
+        out: dict[str, str] = {}
+        for i in range(0, len(ref_hashes), 900):
+            chunk = ref_hashes[i:i + 900]
+            out.update({r["ref_hash"]: r["text"] for r in conn.execute(
+                f"SELECT ref_hash, text FROM filing_text WHERE text != '' AND ref_hash IN "
+                f"({_placeholders(len(chunk))})", chunk)})
+        return out
     finally:
         if own:
             conn.close()

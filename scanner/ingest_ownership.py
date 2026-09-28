@@ -28,8 +28,10 @@ documented phase-2 refinement).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
@@ -37,10 +39,11 @@ from zoneinfo import ZoneInfo
 
 from dateutil import parser as dtparser
 
-from scanner.config import load_settings, load_superinvestors
+from scanner import store
+from scanner.config import load_settings, load_superinvestors, resolve_path
 from scanner.http import PoliteSession
-from scanner.ingest_edgar import _iter_dates, fetch_daily_index
-from scanner.universe import load_map
+from scanner.ingest_edgar import _iter_dates, acceptance_iso, rows_for_day
+from scanner.universe import _norm, load_map
 
 log = logging.getLogger(__name__)
 
@@ -121,22 +124,6 @@ def _flag(text: str, tag: str) -> bool:
     return v is not None and v.strip().lower() in ("1", "true")
 
 
-def _acceptance_iso(text: str, fallback_date: str) -> str:
-    """Parse <ACCEPTANCE-DATETIME>YYYYMMDDHHMMSS (naive ET) from the SGML header."""
-    m = re.search(r"<ACCEPTANCE-DATETIME>(\d{14})", text)
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=_et()).isoformat()
-        except ValueError:
-            pass
-    try:
-        return datetime.strptime(fallback_date, "%Y%m%d").replace(tzinfo=_et()).isoformat()
-    except ValueError:
-        # Raw "YYYYMMDD" sorts after every ISO string — would match every window.
-        log.warning("unparseable ownership date %r — storing empty filed_at", fallback_date)
-        return ""
-
-
 def _subject_cik_int(text: str, form: str) -> int | None:
     """The TRUE subject/issuer CIK, read from the document itself.
 
@@ -183,9 +170,13 @@ def _parse_form4(text: str) -> dict[str, Any]:
     # is a PRICED non-derivative P; the price must come from the buy legs, not
     # from a same-form tax-withholding sale.
     blocks = re.findall(r"<nonDerivativeTransaction>(.*?)</nonDerivativeTransaction>", doc, re.S)
+    footnotes = {fid: re.sub(r"\s+", " ", txt).strip() for fid, txt in
+                 re.findall(r'<footnote id="(F\d+)">(.*?)</footnote>', doc, re.S)}
     codes: list[str] = []
     buy_sh = sell_sh = buy_val = sell_val = 0.0
     buy_date = None
+    owned_after = None
+    buy_notes: list[str] = []
     for b in blocks:
         code = _tag(b, "transactionCode") or ""
         sh = _num(_val(b, "transactionShares"))
@@ -199,6 +190,8 @@ def _parse_form4(text: str) -> dict[str, Any]:
             # Atlantic funds) each file a Form 4 for the SAME purchase; the pack
             # dedupes cluster math on (trade_date, shares, price).
             buy_date = buy_date or _val(b, "transactionDate")
+            owned_after = _num(_val(b, "sharesOwnedFollowingTransaction")) or owned_after
+            buy_notes += [footnotes.get(f, "") for f in re.findall(r'<footnoteId id="(F\d+)"', b)]
         elif code == "S" and sh:
             sell_sh += sh
             if pr:
@@ -213,17 +206,38 @@ def _parse_form4(text: str) -> dict[str, Any]:
     # 10b5-1 pre-planned trades are mechanically scheduled — far weaker signal
     # than a discretionary open-market buy. The document-level checkbox marks it.
     planned = _flag(doc, "aff10b5One")
+    detail = ("10b5-1 PLANNED transaction (pre-scheduled — weaker signal)"
+              if planned else ("discretionary open-market buy" if buy_sh else ""))
+    # Code P also covers PRIVATE purchases (seen live: GSAT "$30M buy" = shares bought
+    # from another director "in a private transaction for estate planning") and IPO /
+    # placement allocations. The buy leg's own footnotes say so — such a row is not an
+    # open-market signal, so it leaves the buy buckets (side BUY-PRIVATE, is_buy 0).
+    private = next((n for n in buy_notes if _PRIVATE_RE.search(n)), None)
+    if buy_sh and private:
+        side, detail = "BUY-PRIVATE", f"PRIVATE/OFFERING purchase per footnote — not open-market: “{private[:160]}”"
+    elif buy_sh and owned_after:
+        before = owned_after - buy_sh
+        # How much the insider grew the (same-line) holding — a 25x increase is a
+        # different signal from topping up 1%.
+        detail += (f"; holding +{buy_sh / before * 100:,.0f}% ({before:,.0f} → {owned_after:,.0f} sh)"
+                   if before > 0 else f"; NEW position ({owned_after:,.0f} sh)")
     return {
         "filer_name": owner,
         "relationship": ", ".join(rel),
         "side": side,
         "shares": shares or None,
-        "price": buy_px if side == "BUY" else sell_px,
-        "trade_date": buy_date if side == "BUY" else None,
-        "is_buy": bool(buy_sh),
-        "detail": ("10b5-1 PLANNED transaction (pre-scheduled — weaker signal)"
-                   if planned else ("discretionary open-market buy" if buy_sh else "")),
+        "price": buy_px if buy_sh else sell_px,
+        "trade_date": buy_date if buy_sh else None,
+        "is_buy": side == "BUY",
+        "detail": detail,
     }
+
+
+_PRIVATE_RE = re.compile(
+    r"private(?:ly)?[\s-]+(?:transaction|negotiated|sale|purchase|placement)|estate planning|"
+    r"subscription agreement|initial public offering|\bIPO\b|underwritten (?:public )?offering|"
+    r"directed share|registered direct|concurrent private|securities purchase agreement|"
+    r"in connection with the (?:offering|closing)", re.I)
 
 
 def _parse_sc13(text: str) -> dict[str, Any]:
@@ -307,6 +321,121 @@ def _amendment_detail(full_txt: str, form: str) -> str:
 # --------------------------------------------------------------------------- #
 # Public entrypoint
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 13F-HR holdings diff (superinvestor NEW / ADD / CUT / EXIT per issuer)
+# --------------------------------------------------------------------------- #
+_CUSIP_CACHE = resolve_path("data/universe/cusip_map.json")
+
+
+def _ns_tag(block: str, tag: str) -> str | None:
+    """Like _tag, tolerating the namespace prefixes some 13F tables use (ns1:)."""
+    m = re.search(rf"<(?:\w+:)?{tag}>(.*?)</(?:\w+:)?{tag}>", block, re.S)
+    return m.group(1).strip() if m else None
+
+
+def parse_13f_table(xml: str) -> dict[str, dict[str, Any]]:
+    """{cusip: {"name", "shares", "value"}} from a 13F information table — SHARE rows only
+    (no bond principal, no put/call option rows), summed across manager lines."""
+    out: dict[str, dict[str, Any]] = {}
+    for row in re.findall(r"<(?:\w+:)?infoTable>(.*?)</(?:\w+:)?infoTable>", xml, re.S):
+        if _ns_tag(row, "putCall") or (_ns_tag(row, "sshPrnamtType") or "SH") != "SH":
+            continue
+        cusip, sh = (_ns_tag(row, "cusip") or "").upper(), _num(_ns_tag(row, "sshPrnamt")) or 0.0
+        if cusip:
+            h = out.setdefault(cusip, {"name": _ns_tag(row, "nameOfIssuer") or "", "shares": 0.0, "value": 0.0})
+            h["shares"] += sh
+            h["value"] += _num(_ns_tag(row, "value")) or 0.0   # USD (whole dollars since 2023)
+    return out
+
+
+def diff_13f(prev: dict[str, dict[str, Any]], cur: dict[str, dict[str, Any]]) -> list[tuple[str, str, float, float]]:
+    """[(cusip, NEW|ADD|CUT|EXIT, prev_shares, cur_shares)] — ADD/CUT = at least a
+    50% change in share count; smaller rebalancing is noise for this purpose."""
+    out = []
+    for c in sorted(prev.keys() | cur.keys()):
+        p, n = prev.get(c, {}).get("shares", 0.0), cur.get(c, {}).get("shares", 0.0)
+        kind = ("NEW" if n and not p else "EXIT" if p and not n else
+                "ADD" if p and n >= p * 1.5 else "CUT" if p and n <= p * 0.5 else None)
+        if kind:
+            out.append((c, kind, p, n))
+    return out
+
+
+def _13f_holdings(session: PoliteSession, cik_int: int, acc: str) -> dict[str, dict[str, Any]]:
+    folder = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc.replace('-', '')}"
+    items = session.edgar_get(f"{folder}/index.json", timeout=30).json()["directory"]["item"]
+    table = next(i["name"] for i in items
+                 if i["name"].lower().endswith(".xml") and i["name"].lower() != "primary_doc.xml")
+    return parse_13f_table(session.edgar_get(f"{folder}/{table}", timeout=60).text)
+
+
+def _cusip_tickers(session: PoliteSession, cusips: list[str]) -> dict[str, str | None]:
+    """CUSIP -> ticker via OpenFIGI (free, no key: 25 requests/min, 10 per request),
+    cached on disk — 13F tables abbreviate names ("ALLY FINL INC"), so names can't be
+    matched reliably."""
+    cache: dict[str, str | None] = {}
+    if _CUSIP_CACHE.exists():
+        cache = json.loads(_CUSIP_CACHE.read_text(encoding="utf-8"))
+    todo = [c for c in cusips if c not in cache]
+    for i in range(0, len(todo), 10):
+        batch = todo[i:i + 10]
+        if i:
+            time.sleep(2.5)                     # stay under the keyless 25/min limit
+        res = session.post("https://api.openfigi.com/v3/mapping", timeout=30,
+                           json=[{"idType": "ID_CUSIP", "idValue": c, "exchCode": "US"} for c in batch]).json()
+        for c, r in zip(batch, res):
+            cache[c] = ((r.get("data") or [{}])[0].get("ticker")) if isinstance(r, dict) else None
+    if todo:
+        _CUSIP_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _CUSIP_CACHE.write_text(json.dumps(cache, indent=0), encoding="utf-8")
+    return {c: cache.get(c) for c in cusips}
+
+
+def _13f_changes(session: PoliteSession, r: dict[str, Any], by_cik: dict[int, dict[str, Any]],
+                 watchlist: list[str]) -> list[dict[str, Any]]:
+    """Ownership rows for a watchlist manager's 13F-HR position changes on universe
+    issuers, vs that manager's previous 13F-HR. [] for amendments / first filings."""
+    if r["form"] != "13F-HR":
+        return []
+    cik10 = str(r["cik"]).zfill(10)
+    recent = session.edgar_get(f"https://data.sec.gov/submissions/CIK{cik10}.json",
+                               timeout=45).json()["filings"]["recent"]
+    filings = sorted(((p, a) for a, f, p in zip(recent["accessionNumber"], recent["form"], recent["reportDate"])
+                      if f == "13F-HR"), reverse=True)
+    period = next((p for p, a in filings if a == r["accession"]), None)
+    prev_acc = next((a for p, a in filings if period and p < period), None)
+    if not (period and prev_acc):
+        return []
+    cur = _13f_holdings(session, r["cik"], r["accession"])
+    prev = _13f_holdings(session, r["cik"], prev_acc)
+    # Skip sub-$5M positions on both sides: a 3,564-share "NEW" line from a
+    # sub-manager (seen live, Berkshire/DHI) is not a superinvestor signal.
+    changes = [ch for ch in diff_13f(prev, cur)
+               if max(prev.get(ch[0], {}).get("value", 0), cur.get(ch[0], {}).get("value", 0)) >= 5e6]
+    tickers = _cusip_tickers(session, [c for c, *_ in changes])
+    by_ticker = {_norm(m.get("ticker", "")): m for m in by_cik.values()}
+    out = []
+    for cusip, kind, p, n in changes:
+        meta = by_ticker.get(_norm(tickers.get(cusip) or ""))
+        if not meta:
+            continue
+        out.append({
+            "ticker": meta.get("ticker", ""), "cik": meta["cik"], "company": meta.get("name", ""),
+            "filer_name": r["company"], "relationship": "", "form_type": "13F-HR",
+            "side": f"13F-{kind}", "shares": n or None, "price": None, "pct": None, "is_buy": 0,
+            "is_insider": 0, "is_activist": 0,
+            "detail": (f"13F {kind}: {p:,.0f} → {n:,.0f} sh (${cur.get(cusip, prev.get(cusip, {})).get('value', 0) / 1e6:,.0f}M; "
+                       f"quarter ending {period}; filed ~45 days later)"),
+            "matched_investor": _match_investor(r["company"], watchlist),
+            "filing_url": _index_url(r["cik"], r["accession"]),
+            "filed_at": acceptance_iso("", r["date"]),
+            "accession": r["accession"],
+            "dedupe_hash": _dedupe_hash(f"{r['accession']}|{cusip}"),
+            "source": "SEC EDGAR",
+        })
+    return out
+
+
 def _txt_url(cik_int: int, accession: str) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession}.txt"
 
@@ -319,10 +448,13 @@ def _index_url(cik_int: int, accession: str) -> str:
 def ingest(session: PoliteSession | None = None,
            since: datetime | None = None,
            until: datetime | None = None,
-           forms: set[str] | None = None) -> list[dict[str, Any]]:
-    """Fetch ownership disclosures for the universe within [since, until].
+           forms: set[str] | None = None,
+           stats: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Fetch NEW ownership disclosures for the universe within [since, until].
 
-    Discovery via the daily index; each matched filing fetched once as .txt.
+    Discovery via the daily index (live feed for today/yesterday); each NEW matched
+    filing fetched once as .txt. `stats` gets {"last_index_day", "failed"} like
+    ingest_edgar.ingest, so the caller never moves the cursor past a lost filing.
     `forms` restricts the issuer-keyed forms processed (default = all of
     ISSUER_FORMS); pass e.g. just the SCHEDULE 13D/13G set to skip the heavy
     Form-4 sweep on a wide backfill. Per-filing failures are isolated and logged.
@@ -342,8 +474,12 @@ def ingest(session: PoliteSession | None = None,
     issuer_hits: list[dict[str, Any]] = []     # Form 4 / 13D / 13G about our companies
     f13_hits: list[dict[str, Any]] = []        # 13F-HR by a watchlist manager
     seen_acc: set[str] = set()
+    last_final = None
     for d in _iter_dates(since, until):
-        for r in fetch_daily_index(session, d):
+        rows, final = rows_for_day(session, d)
+        if final and rows:
+            last_final = d
+        for r in rows:
             if r["form"] in forms and r["cik"] in by_cik:
                 if r["accession"] not in seen_acc:
                     seen_acc.add(r["accession"])
@@ -351,15 +487,21 @@ def ingest(session: PoliteSession | None = None,
             elif r["form"] in ("13F-HR", "13F-HR/A"):   # skip 13F-NT notices (no holdings)
                 if _match_investor(r["company"], watchlist):
                     f13_hits.append(r)
+    # Skip filings already stored — INSERT OR IGNORE would discard them anyway, and
+    # the intraday live-feed sweep would otherwise re-fetch every Form 4 each run.
+    known = store.existing_hashes("ownership", [_dedupe_hash(r["accession"]) for r in issuer_hits + f13_hits])
+    issuer_hits = [r for r in issuer_hits if _dedupe_hash(r["accession"]) not in known]
+    f13_hits = [r for r in f13_hits if _dedupe_hash(r["accession"]) not in known]
 
     # 2. Issuer-keyed forms (Form 4 + 13D/13G): fetch each .txt once, parse.
     #    Fetched concurrently (latency-hiding) under the shared SEC rate gate.
-    def _process_issuer(r: dict[str, Any]) -> dict[str, Any] | None:
+    def _process_issuer(r: dict[str, Any]) -> dict[str, Any] | None | bool:
+        """Record, None (not about a universe company), or False (fetch FAILED)."""
         try:
             text = session.edgar_get(_txt_url(r["cik"], r["accession"]), timeout=45).text
         except Exception as exc:  # noqa: BLE001 - isolate per-filing failures
             log.warning("ownership .txt %s -> %s", r["accession"], exc)
-            return None
+            return False
         # Re-key to the TRUE subject company from the document — the index row we
         # matched may be the FILER's side (e.g. GameStop filing a 13D/A on eBay).
         subj = _subject_cik_int(text, r["form"]) or r["cik"]
@@ -386,7 +528,7 @@ def ingest(session: PoliteSession | None = None,
             "company": meta.get("name") or r["company"],
             "matched_investor": _match_investor(rec.get("filer_name", ""), watchlist),
             "filing_url": _index_url(subj, r["accession"]),
-            "filed_at": _acceptance_iso(text, r["date"]),
+            "filed_at": acceptance_iso(text, r["date"]),
             "accession": r["accession"],
             "dedupe_hash": _dedupe_hash(r["accession"]),
             "source": "SEC EDGAR",
@@ -395,27 +537,42 @@ def ingest(session: PoliteSession | None = None,
         return rec
 
     with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
-        out: list[dict[str, Any]] = [rec for rec in pool.map(_process_issuer, issuer_hits) if rec]
+        results = list(pool.map(_process_issuer, issuer_hits))
+    out: list[dict[str, Any]] = [rec for rec in results if rec]
+    failed = sum(1 for rec in results if rec is False)
 
-    # 3. 13F-HR by a watchlist manager (quarterly/lagged): record the filing event.
+    # 3. 13F-HR by a watchlist manager (quarterly/lagged): diff the holdings against
+    #    the manager's previous 13F-HR (NEW / ADD / CUT / EXIT per universe issuer),
+    #    then record the filing event itself. A failed diff skips BOTH, so the
+    #    filing stays unknown and the next refresh retries it.
     for r in f13_hits:
+        try:
+            changes = _13f_changes(session, r, by_cik, watchlist)
+        except Exception as exc:  # noqa: BLE001 - counted; retried next refresh
+            log.warning("13F diff %s -> %s", r["accession"], exc)
+            failed += 1
+            continue
+        out += changes
         out.append({
             "ticker": "", "cik": "", "company": "",
             "filer_name": r["company"], "relationship": "", "form_type": "13F-HR",
             "side": "13F", "shares": None, "price": None, "pct": None, "is_buy": 0,
             "is_insider": 0, "is_activist": 0,
-            "detail": "quarterly 13F-HR (lagged) — portfolio holdings not parsed",
+            "detail": f"quarterly 13F-HR (lagged) — {len(changes)} universe position changes vs prior 13F",
             "matched_investor": _match_investor(r["company"], watchlist),
             "filing_url": _index_url(r["cik"], r["accession"]),
-            "filed_at": _acceptance_iso("", r["date"]),
+            "filed_at": acceptance_iso("", r["date"]),
             "accession": r["accession"],
             "dedupe_hash": _dedupe_hash(r["accession"]),
             "source": "SEC EDGAR",
         })
 
+    if stats is not None:
+        stats.update(last_index_day=last_final, failed=failed)
     buys = sum(1 for o in out if o.get("is_buy"))
     marquee = sum(1 for o in out if o.get("matched_investor"))
-    log.info("Ownership ingest: %d records (%d insider buys, %d activist 13D, %d superinvestor, %d 13F) [%s..%s]",
+    log.info("Ownership ingest: %d new records (%d insider buys, %d activist 13D, %d superinvestor, "
+             "%d 13F, %d fetch failures) [%s..%s]",
              len(out), buys, sum(1 for o in out if o.get("is_activist")), marquee, len(f13_hits),
-             since.date(), until.date())
+             failed, since.date(), until.date())
     return out

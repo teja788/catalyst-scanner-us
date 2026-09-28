@@ -20,6 +20,7 @@ universe:
     - " - preferred"
 
 lookback_hours: 24          # DEFAULT rolling window; override per-run with --hours N / --days N.
+max_catchup_days: 14        # cap on AUTOMATIC catch-up after a long gap; `refresh --days N` goes further
 request_delay_sec: 0.13     # ~7-8 req/sec, under SEC's 10/sec cap (enforced per session)
 max_retries: 3
 timezone: America/New_York  # all stored/displayed times are ET (EDGAR + US markets run on ET)
@@ -31,16 +32,9 @@ edgar:
   user_agent: "Catalyst Scanner US iamteja1988@gmail.com"
   rate_limit_per_sec: 8     # stay under the 10/sec cap
 
-# ---- News ----
-news:
-  finnhub_enabled: false    # optional; if true, reads FINNHUB_API_KEY from .env (M4/M12)
-
 output:
   digest_dir: digests
   context_pack: runtime/context_pack.md
-
-scoring:
-  mode: agent               # "agent" (live, default) | "llm_api" (future stub, scoring/llm_scorer.py)
 
 # ---- Signal-quality knobs (context pack) ----
 signals:
@@ -48,7 +42,8 @@ signals:
                                    # every buy still appears in the OWNERSHIP section)
   price_reaction: true             # fetch daily closes (Yahoo chart API, free/no key) for priority
                                    # tickers and print "px … % since event" — the priced-in check
-  price_reaction_max_tickers: 50
+  price_reaction_max_tickers: 150  # catalysts + corp events were crowded out at 50
+  contract_min_pct_mcap: 0.25      # federal awards below this % of the recipient's mcap are hidden
 
 # Windows Task Scheduler (M11). Times are LOCAL machine time (you run on IST).
 # NOTE: EDGAR accepts filings until ~10pm ET, and the densest 8-K wave is

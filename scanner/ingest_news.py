@@ -165,7 +165,10 @@ def fetch_feed(session: PoliteSession, feed: dict[str, Any], tagger: Tagger) -> 
     """Fetch + parse one feed into normalised, company-tagged news items."""
     name = feed.get("name", "?")
     trust = feed.get("trust", "news")
-    resp = session.get(feed["url"], timeout=30)
+    # Most feeds want the browser UA; some (GlobeNewswire, verified 2026-09) hang on it
+    # and answer instantly to the contact UA — sources.yaml opts them in.
+    headers = {"User-Agent": session.edgar_ua} if feed.get("contact_ua") else None
+    resp = session.get(feed["url"], timeout=30, headers=headers)
     parsed = feedparser.parse(resp.content)
     items: list[dict[str, Any]] = []
     for e in parsed.entries:
@@ -188,12 +191,14 @@ def fetch_feed(session: PoliteSession, feed: dict[str, Any], tagger: Tagger) -> 
 
 
 def ingest(session: PoliteSession | None = None) -> list[dict[str, Any]]:
-    """Pull all BROAD feeds (skipping per_ticker feeds). Per-feed failures isolated."""
+    """Pull all BROAD feeds (skipping per_ticker feeds). Per-feed failures isolated,
+    but if EVERY feed fails this raises — so the run is marked failed, not "ok"."""
     session = session or PoliteSession()
     tagger = Tagger(load_map())
     feeds = [f for f in load_sources().get("news_feeds", []) if not f.get("per_ticker")]
 
     results: list[dict[str, Any]] = []
+    failed: list[str] = []
     for feed in feeds:
         try:
             items = fetch_feed(session, feed, tagger)
@@ -202,4 +207,7 @@ def ingest(session: PoliteSession | None = None) -> list[dict[str, Any]]:
             results.extend(items)
         except Exception as exc:  # noqa: BLE001 - isolate per-feed failures
             log.warning("News feed failed (%s): %s", feed.get("name"), exc)
+            failed.append(feed.get("name", "?"))
+    if feeds and len(failed) == len(feeds):
+        raise RuntimeError(f"all {len(feeds)} news feeds failed")
     return results
