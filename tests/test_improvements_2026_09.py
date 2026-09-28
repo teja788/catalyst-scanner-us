@@ -119,6 +119,17 @@ def test_13f_diff_kinds():
                                    ("C", "CUT", 100, 40), ("E", "NEW", 0.0, 5)]
 
 
+def test_universe_rebuild_refuses_to_write_a_gutted_map(tmp_path, monkeypatch):
+    from scanner import universe
+    monkeypatch.setattr(universe, "UNIVERSE_DIR", tmp_path)
+    monkeypatch.setattr(universe, "fetch_listed", lambda s: [])          # bot-check page -> 0 rows
+    monkeypatch.setattr(universe, "fetch_cik_map", lambda s: ({}, {}, {}))
+    monkeypatch.setattr(universe, "fetch_mcaps", lambda s: ({}, {"nasdaq": 4005}))
+    with pytest.raises(RuntimeError, match="NOT rebuilt"):
+        universe.build_map(session=object())
+    assert not (tmp_path / "us_universe.json").exists()
+
+
 def test_research_log_leads_parse_only_ranked_leads():
     from scanner.research_log import past_leads
     log = ("# Research log\n\n---\n\n## 2026-09-28 12:48 ET — 10-day scan\n<!-- hash:x -->\n\n"
