@@ -267,6 +267,13 @@ def build_map(session: PoliteSession | None = None) -> dict[str, Any]:
     merged = list(by_cik.values())
     merged.sort(key=lambda r: (r.get("market_cap") or 0.0), reverse=True)
     top = merged[:top_n]
+    # Never replace a good map with a gutted one: seen live 2026-09-29, Nasdaq Trader
+    # served an Incapsula bot-check page (HTTP 200, HTML) -> 0 listed stocks -> an
+    # EMPTY universe was written and every scan would have silently found nothing.
+    if len(top) < top_n // 2:
+        raise RuntimeError(f"Only {len(top)} companies built ({len(listed)} listed stocks) vs top_n "
+                           f"{top_n} — a source likely served a block/challenge page. Universe NOT "
+                           "rebuilt (previous map kept). Retry later.")
 
     (UNIVERSE_DIR / "us_universe.json").write_text(
         json.dumps(top, indent=2, ensure_ascii=False), encoding="utf-8")
