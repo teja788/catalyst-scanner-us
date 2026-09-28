@@ -19,13 +19,13 @@ import collections
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from scanner.config import load_settings, resolve_path
 from scanner.prefilter import run_prefilter
-from scanner.universe import load_map
+from scanner.universe import load_map, load_revenues
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +52,10 @@ _CATALYST_KWS = ("agreement", "contract", "supply", "license", "partnership", "a
 # Forms / 8-K items that are executive-comp or governance — NOT business catalysts.
 # Excluded from the lucrative bucket even if their text mentions FDA/award/phase-3
 # (e.g. comp tied to an FDA-approval "performance condition", or an "equity award").
-_NONCATALYST_FORMS = {"DEF 14A", "DEFA14A", "DEFR14A", "PRE 14A", "PREC14A", "DEFM14A"}
+_NONCATALYST_FORMS = {"DEF 14A", "DEFA14A", "DEFR14A", "PRE 14A", "PREC14A", "DEFM14A",
+                      # periodic reports recite the whole year's agreements — not a
+                      # new forward event (a 20-F's 2023 financing topped the bucket)
+                      "10-K", "10-K/A", "10-Q", "10-Q/A", "20-F", "20-F/A"}
 _COMP_GOV_ITEMS = {"5.02", "5.03", "5.07"}
 
 
@@ -94,16 +97,51 @@ def _max_body_amount(body: str) -> float | None:
     return best or None
 
 
-def _amount_note(body: str, mcap: float | None) -> str:
-    """'≈$36.0M mentioned in body (~5% of mcap)' — or '' when no figure found."""
-    amt = _max_body_amount(body)
-    if not amt:
+def _event_text(body: str, filed_at: str = "") -> str:
+    """The part of a filing body that describes the NEW event: from the first
+    "Item X.YY" heading (past the 8-K cover page), minus sentences that recite
+    history — any sentence naming an earlier year or saying "previously disclosed".
+    (Seen live: CRML's 20-F "$125M" was a 2023 GEM agreement; KYNB's "$220M" was an
+    old closing.) Still a hint: the rubric's date check stands."""
+    if not body:
         return ""
-    note = f"≈{_fmt_usd(amt)} mentioned in body"
-    if mcap:
-        ratio = amt / mcap * 100
-        note += f" (~{ratio:.0f}% of mcap)" if ratio >= 1 else " (<1% of mcap)"
-    return note
+    m = re.search(r"item\s+\d\.\d{2}", body, re.I)
+    start = m.end() if m else 0
+    year = int(filed_at[:4]) if filed_at[:4].isdigit() else None
+    keep = []
+    for sent in re.split(r"(?<=[.;])\s+", body[start:start + 4000]):
+        if re.search(r"previously (?:disclosed|reported|announced)", sent, re.I):
+            continue
+        if year and any(int(y) < year for y in re.findall(r"\b(?:19|20)\d{2}\b", sent)):
+            continue
+        keep.append(sent)
+    return " ".join(keep)
+
+
+def _pct(x: float) -> str:
+    return f"~{x * 100:,.0f}%" if x >= 0.01 else "<1%"
+
+
+def _materiality(f: dict[str, Any], idx: dict[str, dict], rev: dict[str, float]) -> tuple[float, str]:
+    """(ratio, note) for the largest $ figure in the filing's EVENT text. The ratio
+    is vs annual REVENUE when known (>= $10M) — a contract is judged against sales —
+    else vs market cap. Note: '≈$36.0M in event text (~12% of annual revenue, ~5% of mcap)'."""
+    amt = _max_body_amount(_event_text(f.get("body_text") or "", f.get("filed_at") or ""))
+    if not amt:
+        return 0.0, ""
+    cik = f.get("cik", "")
+    mcap, sales = _co(cik, idx).get("market_cap"), rev.get(cik)
+    sales = sales if sales and sales >= 10e6 else None
+    parts = ([f"{_pct(amt / sales)} of annual revenue"] if sales else []) + \
+            ([f"{_pct(amt / mcap)} of mcap"] if mcap else [])
+    ratio = amt / sales if sales else (amt / mcap if mcap else 0.0)
+    note = f"≈{_fmt_usd(amt)} in event text" + (f" ({', '.join(parts)})" if parts else "")
+    if mcap and amt > 5 * mcap:   # NCRA: "$520.5M" on a $4M company = an "up to" cap, not revenue
+        note += f" {_IMPLAUSIBLE} (>5x mcap — likely an 'up to' cap or aspirational total; verify)"
+    return ratio, note
+
+
+_IMPLAUSIBLE = "⚠ implausible"
 
 
 def _catalyst_snippet(body: str) -> str:
@@ -170,10 +208,17 @@ def _label(cik: str, ticker: str, company: str, idx: dict[str, dict]) -> str:
 
 
 def _own_detail(o: dict[str, Any]) -> str:
-    """Shares @ price for a buy (price omitted when it didn't parse), else the stake %."""
-    if o.get("side") == "BUY" and o.get("shares"):
-        return (f"{o['shares']:,.0f} sh @ ${o['price']}" if o.get("price")
-                else f"{o['shares']:,.0f} sh")
+    """Direction + shares @ price for a Form 4 (price omitted when it didn't parse),
+    else the stake %. The side is ALWAYS shown: a superinvestor Form-4 SELL used to
+    render with no direction and read like a marquee buy."""
+    side = o.get("side") or ""
+    if side in ("BUY", "SELL", "BUY-PRIVATE") and o.get("shares"):
+        qty = f"{side} {o['shares']:,.0f} sh"
+        return f"{qty} @ ${o['price']}" if o.get("price") else qty
+    if side.startswith("13F-"):
+        return f"13F {side[4:]}"
+    if (o.get("form_type") or "").startswith("4"):
+        return "no open-market buy/sell (grant/exercise/other)"
     if o.get("pct") is not None:
         s = f"{o['pct']}% stake"
         # Dropping below 5% on a 13D/A is often the FINAL amendment (an exit) —
@@ -296,15 +341,31 @@ def _annotate_ownership_history(priority: dict[str, list], _store) -> None:
         conn.close()
 
 
-def _rank_catalysts_by_materiality(priority: dict[str, list], idx: dict[str, dict]) -> None:
-    """Sort the CATALYST bucket by body-amount / market-cap so the 40%-of-mcap
-    contract is line 1, not lost at position 28 of a 30-item cap. The amount is
-    still only a hint (can be a historical recital) — the rubric's caveat stands."""
+def _rank_catalysts_by_materiality(priority: dict[str, list], idx: dict[str, dict],
+                                   rev: dict[str, float]) -> None:
+    """Sort the CATALYST bucket by event-$ / annual revenue (else / mcap) so the
+    40%-of-sales contract is line 1, not lost at position 28 of a 30-item cap. The
+    amount is still only a hint — the rubric's date check stands."""
     for f in priority.get("catalysts", []):
-        amt = _max_body_amount(f.get("body_text") or "")
-        mcap = _co(f.get("cik", ""), idx).get("market_cap")
-        f["_mat_ratio"] = (amt / mcap) if (amt and mcap) else 0.0
-    priority.get("catalysts", []).sort(key=lambda f: f.get("_mat_ratio", 0.0), reverse=True)
+        f["_mat_ratio"], f["_mat_note"] = _materiality(f, idx, rev)
+    # implausible magnitudes (> 5x mcap) rank after every plausible one
+    priority.get("catalysts", []).sort(
+        key=lambda f: (_IMPLAUSIBLE not in f.get("_mat_note", ""), f.get("_mat_ratio", 0.0)), reverse=True)
+
+
+def _filter_contracts(priority: dict[str, list], idx: dict[str, dict], settings: dict[str, Any]) -> None:
+    """Keep federal awards that are material to the recipient (award / mcap >=
+    signals.contract_min_pct_mcap %), largest ratio first. The raw feed ranked by
+    date and was full of $4k-$50k awards to $50B+ companies."""
+    floor = float((settings.get("signals") or {}).get("contract_min_pct_mcap", 0.25)) / 100
+    ext = priority.get("external", [])
+    contracts = [e for e in ext if e.get("category") == "contract"]
+    for e in contracts:
+        mcap = _co(e.get("cik", ""), idx).get("market_cap")
+        e["_mat_ratio"] = (e["amount"] / mcap) if (e.get("amount") and mcap) else 0.0
+    keep = sorted((e for e in contracts if e["_mat_ratio"] >= floor), key=lambda e: e["_mat_ratio"], reverse=True)
+    priority["external"] = [e for e in ext if e.get("category") != "contract"] + keep
+    priority["contracts_hidden"] = len(contracts) - len(keep)
 
 
 def _attach_watchlist(priority: dict[str, list], filings: list[dict[str, Any]],
@@ -317,23 +378,22 @@ def _attach_watchlist(priority: dict[str, list], filings: list[dict[str, Any]],
 
 
 def _fetch_price_reactions(priority: dict[str, list], settings: dict[str, Any]) -> dict[str, dict]:
-    """{ticker: closes} for the priority tickers — the 'has it already re-rated?'
-    check on the under-appreciated gate. Best-effort; empty dict when disabled or
-    the quote source is down."""
+    """{ticker: {"closes", "volumes"}} for the priority tickers — the 'has it
+    already re-rated?' check on the under-appreciated gate. Business catalysts and
+    corporate events come right after superinvestors: with a 50-ticker cap they were
+    crowded out (KOD's +171% Phase-3 day showed no px line). Best-effort."""
     sig = settings.get("signals") or {}
     if not sig.get("price_reaction", True):
         return {}
-    max_tickers = int(sig.get("price_reaction_max_tickers", 50))
+    max_tickers = int(sig.get("price_reaction_max_tickers", 150))
+    items = (priority.get("watchlist_ownership", [])[:10] + priority.get("superinvestor", [])
+             + priority.get("catalysts", [])[:30] + [f for f, _h in priority.get("corporate_events", [])[:25]]
+             + priority.get("buy_clusters", [])[:10] + priority.get("insider_buys", [])[:25]
+             + [o for o in priority.get("superinvestor_13f", []) if o.get("cik")][:30]
+             + priority.get("activist", [])[:40] + priority.get("external", [])[:60])
     tickers: list[str] = []
-    for bucket, cap in (("watchlist_ownership", 10), ("superinvestor", 99), ("activist", 40),
-                        ("buy_clusters", 10), ("insider_buys", 25), ("catalysts", 30),
-                        ("external", 40)):
-        for item in priority.get(bucket, [])[:cap]:
-            t = (item.get("ticker") or "").strip()
-            if t and t not in tickers:
-                tickers.append(t)
-    for f, _hits in priority.get("corporate_events", [])[:25]:
-        t = (f.get("ticker") or "").strip()
+    for item in items:
+        t = (item.get("ticker") or "").strip()
         if t and t not in tickers:
             tickers.append(t)
     tickers = tickers[:max_tickers]
@@ -344,29 +404,60 @@ def _fetch_price_reactions(priority: dict[str, list], settings: dict[str, Any]) 
     from scanner.http import PoliteSession
     session = PoliteSession()
     with ThreadPoolExecutor(max_workers=8) as pool:
-        pairs = pool.map(lambda t: (t, _price.fetch_daily_closes(session, t)), tickers)
-    out = {t: closes for t, closes in pairs if closes}
+        pairs = pool.map(lambda t: (t, _price.fetch_daily(session, t)), tickers)
+    out = {t: data for t, data in pairs if data}
     log.info("Price reactions fetched for %d/%d priority tickers", len(out), len(tickers))
     return out
 
 
 def _price_note(ticker: str, event_iso: str | None, prices: dict[str, dict]) -> str:
-    """'px $12.34 (+18.2% since event)' — or '' when no data."""
-    closes = prices.get((ticker or "").strip())
-    if not closes:
+    """'px $12.34 (+18.2% since event) · last session +3.1% on 4.2x avg volume' —
+    or '' when no data. The last-session part is the 'moving on it NOW?' check."""
+    data = prices.get((ticker or "").strip())
+    if not data:
         return ""
     from scanner.adapters import price as _price
-    r = _price.reaction(closes, event_iso or "")
+    r = _price.reaction(data["closes"], event_iso or "")
     if not r:
         return ""
-    return f"px ${r['last']:,.2f} ({r['pct_since_event']:+.1f}% since event)"
+    note = f"px ${r['last']:,.2f} ({r['pct_since_event']:+.1f}% since event)"
+    ls = _price.last_session(data)
+    if ls:
+        note += f" · last session {ls['pct']:+.1f}% on {ls['vol_x']:.1f}x avg volume"
+    return note
+
+
+def _flag_price_mismatch(ownership: list[dict[str, Any]], clusters: list[dict[str, Any]],
+                         prices: dict[str, dict]) -> None:
+    """Warn when a Form-4 buy price is far (>1.5x / <0.67x) from the market close on
+    the trade date: the price is in a foreign currency (BBD: BRL 17.98 vs ADR $3.37)
+    or the trade was not at market. Clusters inherit the warning — their $ is wrong."""
+    from scanner.adapters import price as _price
+    flagged: set[str] = set()
+    for o in ownership:
+        data = prices.get((o.get("ticker") or "").strip())
+        if not (o.get("is_buy") and o.get("price") and data):
+            continue
+        ref = _price.close_on_or_before(data["closes"], o.get("trade_date") or o.get("filed_at") or "")
+        if ref and ref[1] and not 0.67 <= o["price"] / ref[1] <= 1.5:
+            o["px_warn"] = (f"Form-4 price ${o['price']:,.2f} vs market close ${ref[1]:,.2f} on {ref[0]} — "
+                            "foreign currency or not an open-market price; $ totals unreliable")
+            flagged.add(o.get("cik", ""))
+    for cl in clusters:
+        if cl.get("cik") in flagged:
+            cl["px_warn"] = "Form-4 prices do not match the market price — $ total unreliable (currency/plan?)"
 
 
 def build_context_pack(summary: dict[str, Any] | None = None,
                        since: datetime | None = None,
                        enrich_bodies: bool = True,
-                       fetch_bodies: bool = True) -> dict[str, Any]:
+                       fetch_bodies: bool = True,
+                       out_path: str | None = None) -> dict[str, Any]:
     """Assemble + write the context pack. Returns paths and headline stats.
+
+    `out_path` (project-relative .md) defaults to settings output.context_pack —
+    the file the agent reads. The dashboard passes its own path so opening it
+    never overwrites the pack a CLI `scan` just wrote.
 
     `enrich_bodies` reads the primary document of catalyst-tagged filings (cached)
     so an 8-K "Material Agreement" reveals WHAT the contract is. `fetch_bodies=False`
@@ -421,16 +512,19 @@ def build_context_pack(summary: dict[str, Any] | None = None,
     priority["external"] = _store.get_recent_external_catalysts(_since_date) if _since_date else []
     runs = _store.get_runs()   # per-source freshness for the pack header
 
+    rev = load_revenues()      # annual revenue by CIK — the materiality denominator
     _annotate_ownership_history(priority, _store)
-    _rank_catalysts_by_materiality(priority, idx)
+    _rank_catalysts_by_materiality(priority, idx, rev)
+    _filter_contracts(priority, idx, settings)
     _attach_watchlist(priority, filings, ownership, _store)
     prices = _fetch_price_reactions(priority, settings) if fetch_bodies else {}
+    _flag_price_mismatch(ownership, priority.get("buy_clusters", []), prices)
 
     md = _render_md(summary, priority, filings, ownership, tagged_news, market_news,
-                    coverage, idx, runs, prices)
-    pack_json = _render_json(summary, priority, filings, ownership, tagged_news, coverage, idx, prices)
+                    coverage, idx, runs, prices, rev)
+    pack_json = _render_json(summary, priority, filings, ownership, tagged_news, coverage, idx, prices, rev)
 
-    md_path = resolve_path(settings.get("output", {}).get("context_pack", "runtime/context_pack.md"))
+    md_path = resolve_path(out_path or settings.get("output", {}).get("context_pack", "runtime/context_pack.md"))
     json_path = md_path.with_suffix(".json")
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(md, encoding="utf-8")
@@ -444,16 +538,18 @@ def build_context_pack(summary: dict[str, Any] | None = None,
         "ownership_flagged": summary["ownership_flagged"],
         "company_news": len(tagged_news),
         "market_news": len(market_news),
-        "priority": {k: len(v) for k, v in priority.items()},
+        "priority": {k: len(v) if isinstance(v, list) else v for k, v in priority.items()},
     }
     log.info("Context pack written: %s", stats)
     return stats
 
 
 def _render_md(summary, priority, filings, ownership, tagged_news, market_news, coverage, idx,
-               runs: dict[str, dict] | None = None, prices: dict[str, dict] | None = None) -> str:
+               runs: dict[str, dict] | None = None, prices: dict[str, dict] | None = None,
+               rev: dict[str, float] | None = None) -> str:
     out: list[str] = []
     prices = prices or {}
+    rev = rev or {}
     _now_dt = datetime.now(_tz())
     now = _now_dt.strftime("%Y-%m-%d %H:%M ET")
     uni = load_settings().get("universe", {})
@@ -468,22 +564,34 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
     if runs:
         parts, stale = [], []
         for src in ("edgar", "news", "ownership", "external"):
-            last = (runs.get(src) or {}).get("last_success_at")
-            if not last:
+            r = runs.get(src) or {}
+            if not r.get("last_success_at"):
                 parts.append(f"{src}: never")
                 stale.append(src)
                 continue
-            parts.append(f"{src}: {_et_short(last)}")
+            ok = r.get("status") == "ok"
+            part = f"{src}: {'ok' if ok else 'FAILED'} {_et_short(r.get('updated_at'))}"
+            if src in ("edgar", "ownership"):
+                # The cursor = start of the day after the last FINAL daily index, so
+                # "through" is the last fully-indexed filing day. Later days in the
+                # pack come from EDGAR's live feed (best-effort) until that index lands.
+                try:
+                    thru = datetime.fromisoformat(r["last_success_at"]) - timedelta(days=1)
+                    part += f" (index through {thru:%a %Y-%m-%d}; later days via live feed)"
+                except ValueError:
+                    pass
+            parts.append(part)
             try:
-                age_h = (_now_dt - datetime.fromisoformat(last)).total_seconds() / 3600
-                if age_h > 48:
-                    stale.append(src)
+                age_h = (_now_dt - datetime.fromisoformat(r.get("updated_at") or "")).total_seconds() / 3600
             except ValueError:
-                pass
+                age_h = 1e9
+            if not ok or age_h > 48:
+                stale.append(src)
         out.append("Data freshness: " + "  ·  ".join(parts))
         if stale:
-            out.append(f"> ⚠ STALE: {', '.join(stale)} last refreshed >48h ago (or never) — "
-                       "empty sections may mean 'not fetched', not 'quiet day'. Run `refresh` first.")
+            out.append(f"> ⚠ STALE/FAILED: {', '.join(stale)} — last run failed, or no run in >48h "
+                       "(or never). Empty sections may mean 'not fetched', not 'quiet day'. "
+                       "Run `refresh` and check runtime/logs/scanner.log.")
     # Body-coverage disclosure: catalyst tags come from filing BODIES; if the
     # fetch cap bit, say so instead of letting the CATALYST bucket imply completeness.
     _enr = summary.get("enrich") or {}
@@ -505,7 +613,10 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
                             priority["insider_buys"], priority["corporate_events"])
     out.append("## ⚡ PRIORITY SIGNALS — read first (highest-signal; any overflow is "
                "counted below, never silently lost)")
-    if not (sup or act or buys or evts):
+    if not any(priority.get(k) for k in ("superinvestor", "superinvestor_13f", "activist",
+                                         "buy_clusters", "insider_buys", "corporate_events",
+                                         "catalysts", "external", "watchlist_filings",
+                                         "watchlist_ownership")):
         out.append("_No priority signals in window._")
 
     def _overflow(total: int, cap: int, kind: str) -> None:
@@ -552,9 +663,19 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
         if o.get("filing_url"):
             out.append(f"  Source: {o['filing_url']}")
     if priority.get("superinvestor_13f"):
-        names = sorted({o.get("matched_investor") for o in priority["superinvestor_13f"] if o.get("matched_investor")})
-        out.append(f"[SUPERINVESTOR 13F-HR — quarterly/lagged] filed recently: {', '.join(names)} "
-                   f"(portfolio holdings not parsed — dig the filing)")
+        names = sorted({o.get("matched_investor") for o in priority["superinvestor_13f"]
+                        if o.get("matched_investor") and not o.get("cik")})
+        if names:
+            out.append(f"[SUPERINVESTOR 13F-HR — quarterly/lagged] filed recently: {', '.join(names)}")
+        changes = [o for o in priority["superinvestor_13f"] if o.get("cik")]
+        for o in changes[:30]:   # per-issuer NEW / ADD / CUT / EXIT vs the prior 13F
+            out.append(f"[SUPERINVESTOR 13F: {o.get('matched_investor')}] "
+                       f"{_label(o.get('cik',''), o.get('ticker',''), o.get('company',''), idx)} — "
+                       f"{o.get('detail','')}")
+            _px(o)
+            if o.get("filing_url"):
+                out.append(f"  Source: {o['filing_url']}")
+        _overflow(len(changes), 30, "13F position changes")
     for o in act[:40]:   # activist 13D AND 13D/A (amendments included)
         out.append(f"[ACTIVIST {o.get('form_type','')}] "
                    f"{_label(o.get('cik',''), o.get('ticker',''), o.get('company',''), idx)} {_own_detail(o)} — "
@@ -571,6 +692,8 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
                     if cl.get("unpriced_shares") else "")
         out.append(f"[BUY CLUSTER] {_label(cl['cik'], cl.get('ticker', ''), cl.get('company', ''), idx)} — "
                    f"{cl['n_insiders']} insiders bought ≈${cl['usd']:,.0f} combined in window{unpriced}")
+        if cl.get("px_warn"):
+            out.append(f"  ⚠ {cl['px_warn']}")
     _overflow(len(priority.get("buy_clusters", [])), 10, "buy clusters")
     for o in buys[:25]:
         rel = f" ({o['relationship']})" if o.get("relationship") else ""
@@ -583,6 +706,8 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
             marks.append("first buy by this insider in stored history")
         if marks:
             out.append(f"  → {'; '.join(marks)}")
+        if o.get("px_warn"):
+            out.append(f"  ⚠ {o['px_warn']}")
         _px(o)
         if o.get("filing_url"):
             out.append(f"  Source: {o['filing_url']}")
@@ -605,21 +730,23 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
         snip = _catalyst_snippet(f.get("body_text") or "")
         if snip:
             out.append(f"  → {snip}")
-        note = _amount_note(f.get("body_text") or "", _co(f.get("cik", ""), idx).get("market_cap"))
+        note = f.get("_mat_note")
         if note:
             out.append(f"  $ {note}")
         _px(f)
         if f.get("filing_url"):
             out.append(f"  Source: {f['filing_url']}")
-    _overflow(len(priority.get("catalysts", [])), 30, "business-catalyst filings (ranked by materiality-to-size)")
+    _overflow(len(priority.get("catalysts", [])), 30, "business-catalyst filings (ranked by $ vs revenue/mcap)")
     # External feeds (non-EDGAR): federal contracts, FDA/clinical, patents.
     _ext = priority.get("external", [])
     if _ext:
         _bycat: dict[str, list] = {}
         for e in _ext:
             _bycat.setdefault(e.get("category", "other"), []).append(e)
-        _labels = {"contract": "FEDERAL CONTRACT", "fda": "FDA / CLINICAL", "patent": "PATENT"}
-        for cat in ("fda", "contract", "patent"):
+        _labels = {"contract": "FEDERAL CONTRACT", "fda": "FDA / CLINICAL",
+                   "pdufa": "PDUFA / ADCOMM (scheduled)", "patent": "PATENT"}
+        _bycat.get("pdufa", []).sort(key=lambda e: e.get("event_date") or "")   # soonest first
+        for cat in ("fda", "pdufa", "contract", "patent"):
             for e in _bycat.get(cat, [])[:20]:
                 amt = f" ${e['amount']:,.0f}" if e.get("amount") else ""
                 out.append(f"[{_labels.get(cat, cat.upper())}: {e.get('source')}] "
@@ -631,6 +758,9 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
                 if e.get("url"):
                     out.append(f"  Source: {e['url']}")
             _overflow(len(_bycat.get(cat, [])), 20, f"{_labels.get(cat, cat)} items")
+    if priority.get("contracts_hidden"):
+        out.append(f"  _{priority['contracts_hidden']} federal awards below the materiality floor "
+                   f"(award / mcap < signals.contract_min_pct_mcap) or unpriced — hidden._")
     out.append("")
     out.append("> NOTE: a 13D/A shows the CURRENT %, not whether the investor ADDED or TRIMMED — "
                "verify direction in the filing. Treat 13D and 13D/A equally as activist signals.")
@@ -646,7 +776,7 @@ def _render_md(summary, priority, filings, ownership, tagged_news, market_news, 
         routine = " [routine]" if f.get("is_routine") else ""
         tagstr = f"  | tags: [{', '.join(tags)}]" if tags else ""
         cov = coverage.get(cik, 0)
-        note = _amount_note(f.get("body_text") or "", _co(cik, idx).get("market_cap"))
+        note = _materiality(f, idx, rev)[1]
         notestr = f"  | {note}" if note else ""
         out.append(f"[SEC FILING] {_label(cik, f.get('ticker',''), f.get('company',''), idx)} — "
                    f"{f.get('form_type','')} — {_et_short(f.get('filed_at'))}{routine}")
@@ -720,22 +850,24 @@ def _own_json(o: dict[str, Any], idx: dict[str, dict]) -> dict[str, Any]:
         "matched_investor": o.get("matched_investor"), "is_buy": bool(o.get("is_buy")),
         "is_activist": bool(o.get("is_activist")), "detail": o.get("detail"),
         "pct_delta": o.get("pct_delta"), "switched_from_13g": bool(o.get("switched_from_13g")),
-        "first_stored_buy": bool(o.get("first_stored_buy")),
+        "first_stored_buy": bool(o.get("first_stored_buy")), "px_warn": o.get("px_warn"),
         "filed_at": o.get("filed_at"), "source": o.get("filing_url"),
     }
 
 
 def _px_json(item: dict[str, Any], prices: dict[str, dict]) -> dict[str, Any] | None:
-    closes = prices.get((item.get("ticker") or "").strip())
-    if not closes:
+    data = prices.get((item.get("ticker") or "").strip())
+    if not data:
         return None
     from scanner.adapters import price as _price
-    return _price.reaction(closes, item.get("filed_at") or item.get("event_date") or "")
+    r = _price.reaction(data["closes"], item.get("filed_at") or item.get("event_date") or "")
+    return {**r, "last_session": _price.last_session(data)} if r else None
 
 
 def _render_json(summary, priority, filings, ownership, tagged_news, coverage, idx,
-                 prices: dict[str, dict] | None = None) -> dict[str, Any]:
+                 prices: dict[str, dict] | None = None, rev: dict[str, float] | None = None) -> dict[str, Any]:
     prices = prices or {}
+    rev = rev or {}
     return {
         "generated_at": datetime.now(_tz()).isoformat(),
         "window_since": summary["window_since"],
@@ -755,7 +887,9 @@ def _render_json(summary, priority, filings, ownership, tagged_news, coverage, i
             },
             "superinvestor": [{**_own_json(o, idx), "price_reaction": _px_json(o, prices)}
                               for o in priority["superinvestor"]],
-            "superinvestor_13f": sorted({o.get("matched_investor") for o in priority["superinvestor_13f"] if o.get("matched_investor")}),
+            "superinvestor_13f": sorted({o.get("matched_investor") for o in priority["superinvestor_13f"]
+                                         if o.get("matched_investor") and not o.get("cik")}),
+            "superinvestor_13f_changes": [_own_json(o, idx) for o in priority["superinvestor_13f"] if o.get("cik")],
             "activist": [{**_own_json(o, idx), "price_reaction": _px_json(o, prices)}
                          for o in priority["activist"][:60]],
             "buy_clusters": priority.get("buy_clusters", [])[:20],
@@ -773,7 +907,7 @@ def _render_json(summary, priority, filings, ownership, tagged_news, coverage, i
                 "form_type": f.get("form_type"),
                 "tags": [t for t in (f.get("candidate_tags") or []) if t in CATALYST_TAGS],
                 "snippet": _catalyst_snippet(f.get("body_text") or ""),
-                "body_amount": _max_body_amount(f.get("body_text") or ""),
+                "materiality": f.get("_mat_note") or None,
                 "materiality_ratio": f.get("_mat_ratio") or None,
                 "price_reaction": _px_json(f, prices),
                 "filed_at": f.get("filed_at"), "source": f.get("filing_url"),
@@ -790,7 +924,7 @@ def _render_json(summary, priority, filings, ownership, tagged_news, coverage, i
             "market_cap": _co(f.get("cik", ""), idx).get("market_cap"),
             "form_type": f.get("form_type"), "item_codes": f.get("item_codes") or [],
             "candidate_tags": f.get("candidate_tags") or [], "is_routine": bool(f.get("is_routine")),
-            "body_amount": _max_body_amount(f.get("body_text") or ""),
+            "materiality": _materiality(f, idx, rev)[1] or None,
             "headline": f.get("headline"), "filed_at": f.get("filed_at"),
             "coverage": coverage.get(f.get("cik", ""), 0), "source": f.get("filing_url"),
         } for f in filings],

@@ -64,15 +64,9 @@ def _ex99_text(session: PoliteSession, f: dict[str, Any]) -> str:
     return ""
 
 
-def _body_for(session: PoliteSession, f: dict[str, Any], fetch_missing: bool = True) -> str:
-    """Return cached (or, if `fetch_missing`, freshly-fetched) body text for one filing."""
+def _body_for(session: PoliteSession, f: dict[str, Any]) -> str:
+    """Fetch (and cache) body text for one filing not yet in the cache."""
     h = f.get("dedupe_hash")
-    if h:
-        cached = store.get_filing_text(h)
-        if cached and cached.get("text"):
-            return cached["text"]
-    if not fetch_missing:
-        return ""
     url = f.get("filing_url") or ""
     if not url.lower().endswith((".htm", ".html", ".txt")):
         return ""
@@ -110,29 +104,36 @@ def _enrich_rank(f: dict[str, Any]) -> int:
 
 def enrich(filings: list[dict[str, Any]], session: PoliteSession | None = None,
            max_fetch: int = 80, fetch_missing: bool = True) -> dict[str, int]:
-    """Fetch + cache body text for up to `max_fetch` non-routine filings; set
-    f['body_text'] and ADD any catalyst tags found in the body.
+    """Read body text for non-routine candidate filings; set f['body_text'] and ADD
+    any catalyst tags found in the body.
 
     Targets: every catalyst-tagged filing PLUS untagged 6-K/6-K/A current reports —
     6-Ks carry no 8-K item codes and a useless doc-description headline, so reading
     the body is the ONLY way an ADR catalyst (TSM, ASML, NVO...) can surface.
-    When the cap bites, deal-bearing 8-Ks (1.01/2.01/8.01/7.01) go first.
+
+    Cached bodies are ALWAYS read (no network, no cap). `max_fetch` caps only the
+    NEW network fetches — so each re-run really does read further into a wide
+    window (the cap used to count cached bodies, so every pass re-read the same N).
+    When the cap bites, deal-bearing 8-Ks (1.01/2.01/8.01/7.01) are fetched first.
+    `fetch_missing=False` fetches nothing — zero network, dashboard-snappy.
 
     Body-derived tags are PERSISTED back to the filings table, so tag queries and
-    later cache-only passes (the dashboard) see them too. `fetch_missing=False`
-    uses only already-cached bodies — zero network, dashboard-snappy.
+    later cache-only passes (the dashboard) see them too.
 
-    Returns {"targets": fetched, "skipped": beyond-cap, "retagged": n} so the
-    context pack can DISCLOSE incomplete body coverage instead of hiding it.
+    Returns {"targets": read, "skipped": not read (beyond cap / not cached),
+    "retagged": n} so the context pack can DISCLOSE incomplete body coverage.
     """
     session = session or PoliteSession()
     candidates = [f for f in filings if not f.get("is_routine")
                   and (f.get("candidate_tags") or (f.get("form_type") or "").startswith("6-K"))]
     candidates.sort(key=_enrich_rank)          # stable: recency preserved within rank
-    targets = candidates[:max_fetch]
-    skipped = len(candidates) - len(targets)
+    cached = store.get_filing_texts([f["dedupe_hash"] for f in candidates if f.get("dedupe_hash")])
+    missing = [f for f in candidates if f.get("dedupe_hash") not in cached]
+    to_fetch = missing[:max_fetch] if fetch_missing else []
+    skipped = len(missing) - len(to_fetch)
     with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
-        results = list(pool.map(lambda x: (x, _body_for(session, x, fetch_missing)), targets))
+        fetched = list(pool.map(lambda x: (x, _body_for(session, x)), to_fetch))
+    results = [(f, cached[f["dedupe_hash"]]) for f in candidates if f.get("dedupe_hash") in cached] + fetched
     tag_updates: list[tuple[int, list[str]]] = []
     for f, text in results:
         f["body_text"] = text
@@ -142,6 +143,6 @@ def enrich(filings: list[dict[str, Any]], session: PoliteSession | None = None,
                 tag_updates.append((f["id"], merged))
             f["candidate_tags"] = merged
     store.set_filing_tags_bulk(tag_updates)
-    log.info("Filing-body enrich: %d filings read (%s), %d skipped by cap, %d re-tagged from body",
-             len(targets), "cached+fetched" if fetch_missing else "cache-only", skipped, len(tag_updates))
-    return {"targets": len(targets), "skipped": skipped, "retagged": len(tag_updates)}
+    log.info("Filing-body enrich: %d filings read (%d fetched), %d not read, %d re-tagged from body",
+             len(results), len(fetched), skipped, len(tag_updates))
+    return {"targets": len(results), "skipped": skipped, "retagged": len(tag_updates)}

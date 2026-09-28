@@ -35,8 +35,7 @@ nasdaq_trader:
 
 nasdaq_screener:
   # Returns symbol + marketCap + sector + country. Needs browser-like headers
-  # (set in http.py). One bulk call per exchange. Primary market-cap source;
-  # yfinance is the per-symbol fallback if this bot-blocks (verified in M2).
+  # (set in http.py). One bulk call per exchange. The only market-cap source.
   stocks_api: https://api.nasdaq.com/api/screener/stocks?tableonly=true&download=true
 
 # --------------------------------------------------------------------------- #
@@ -58,6 +57,7 @@ news_feeds:
   - name: GlobeNewswire (Public Companies)
     url: https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire-Public-Companies
     trust: wire
+    contact_ua: true   # hangs ~40s+ on a browser UA, 0.7s on the contact UA (verified 2026-09-28)
 
   # ---- Financial news (lower trust, broad) ----
   - name: CNBC (Markets)
@@ -96,11 +96,3 @@ news_feeds:
   # ACCESSWIRE: https://www.accesswire.com/users/rss.aspx returned 0 entries.
   # MarketWatch (RealTime): served STALE content (latest entry ~1 year old), like
   #   India's Moneycontrol cache issue — useless for a recency scanner.
-
-# --------------------------------------------------------------------------- #
-# Optional free news API (off by default; key in .env). Reserved for market-news
-# + targeted `ask` pulls — NOT a per-ticker sweep over the whole universe.
-# --------------------------------------------------------------------------- #
-finnhub:
-  company_news: https://finnhub.io/api/v1/company-news     # ?symbol=&from=&to=&token=
-  market_news:  https://finnhub.io/api/v1/news             # ?category=general&token=

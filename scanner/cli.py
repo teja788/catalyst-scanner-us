@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import typer
@@ -64,18 +64,6 @@ def _main() -> None:
     )
 
 
-def _todo(command: str, milestone: str) -> None:
-    """Uniform 'planned but not built yet' notice, so the CLI is honest about scope."""
-    console.print(
-        Panel.fit(
-            f"[yellow]'{command}'[/yellow] is scaffolded but not implemented yet.\n"
-            f"It will be built in [bold]{milestone}[/bold].",
-            title="Not yet implemented",
-            border_style="yellow",
-        )
-    )
-
-
 def _fmt_usd(v: float | None) -> str:
     """Human-readable market cap: $3.0T, $850.2B, $1.2M, or em-dash if unknown."""
     if not v:
@@ -99,7 +87,6 @@ def version() -> None:
     table.add_row("Include ADRs", str(uni.get("include_adrs")))
     table.add_row("Lookback (hours)", str(s.get("lookback_hours")))
     table.add_row("Timezone", str(s.get("timezone")))
-    table.add_row("Scoring mode", str(s.get("scoring", {}).get("mode")))
     table.add_row("EDGAR User-Agent", str(s.get("edgar", {}).get("user_agent")))
     console.print(Panel(table, title=__app_name__, border_style="cyan"))
 
@@ -107,10 +94,17 @@ def version() -> None:
 @app.command(name="setup-universe")
 def setup_universe() -> None:
     """(Re)build the top-N US-by-market-cap universe + ticker->CIK map."""
-    from scanner.universe import _norm, build_map, load_map
+    from scanner.universe import _norm, build_map, fetch_revenues, load_map
 
     with console.status("[cyan]Fetching Nasdaq Trader lists + SEC CIK map + market caps..."):
-        stats = build_map()
+        try:
+            stats = build_map()
+        except RuntimeError as exc:   # screener failure: previous map kept
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+    with console.status("[cyan]Fetching annual revenues (SEC XBRL frames) for materiality..."):
+        n_rev = fetch_revenues()
+    console.print(f"[dim]Revenue map: {n_rev:,} companies (materiality denominator).[/dim]")
 
     table = Table(title="Universe built", border_style="green")
     table.add_column("Metric")
@@ -135,7 +129,7 @@ def setup_universe() -> None:
     spot.add_column("CIK")
     spot.add_column("Market cap", justify="right")
     spot.add_column("Company")
-    for t in ("AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "TSLA"):
+    for t in ("AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK.A", "TSLA"):
         hit = by_norm.get(_norm(t))
         if hit:
             i, c = hit
@@ -185,32 +179,64 @@ def _refresh_all(since_override: datetime | None = None,
 
     def _do(source: str, fetch_and_store) -> None:
         try:
-            fetched, new = fetch_and_store()
-            store.mark_run(source, fetched, "ok")
+            fetched, new, *cursor = fetch_and_store()
+            store.mark_run(source, fetched, "ok", success_at=cursor[0] if cursor else None)
             results[source] = {"fetched": fetched, "new": new, "status": "ok"}
         except Exception as exc:  # noqa: BLE001 - per-source isolation
             store.mark_run(source, 0, "error", note=str(exc)[:200])
             results[source] = {"fetched": 0, "new": 0, "status": f"error: {exc}"}
             log.warning("refresh source %s failed: %s", source, exc)
 
+    lookback = timedelta(hours=int(load_settings().get("lookback_hours", 24)))
+
+    max_gap = timedelta(days=int(load_settings().get("max_catchup_days", 14)))
+
+    def _fetch_since(source: str) -> datetime:
+        """The EARLIER of the --hours/--days start and the stored cursor: a narrow
+        window must never make the catch-up skip the gap since the last run. An
+        automatic catch-up is capped at `max_catchup_days` (a months-old cursor
+        would mean tens of thousands of fetches); an explicit --days is honoured."""
+        cur = store.get_last_success(source)
+        floor = datetime.now(_tz()) - max_gap
+        if cur and cur < floor:
+            log.warning("%s cursor %s is older than %s — catching up from %s only; "
+                        "use `refresh --days N` to backfill further", source, cur, max_gap, floor)
+            cur = floor
+        cands = [t for t in (since_override, cur) if t]
+        return min(cands) if cands else datetime.now(_tz()) - lookback
+
+    def _next_cursor(source: str, stats: dict, since: datetime) -> datetime:
+        """Start of the day after the last FINAL daily index read — never past a day
+        that was only seen via the live feed or not published yet. No final day in
+        the sweep = the cursor stays where it was."""
+        d = stats.get("last_index_day")
+        if not d:
+            return store.get_last_success(source) or since
+        return min(datetime.combine(d + timedelta(days=1), time(), tzinfo=_tz()), datetime.now(_tz()))
+
+    def _swept(source: str, ingest, upsert):
+        since, stats = _fetch_since(source), {}
+        items = ingest(session=session, since=since, stats=stats)
+        new = upsert(items)
+        if stats.get("failed"):   # stored what we got; keep the cursor so the rest is retried
+            raise RuntimeError(f"{stats['failed']} filings failed to fetch ({new} new stored) — "
+                               "cursor kept; the next refresh retries them")
+        return len(items), new, _next_cursor(source, stats, since)
+
     def _edgar():
-        since = since_override or store.get_last_success("edgar")
-        items = ingest_edgar.ingest(session=session, since=since)
-        return len(items), store.upsert_filings(items)
+        return _swept("edgar", ingest_edgar.ingest, store.upsert_filings)
 
     def _news():
         items = ingest_news.ingest(session=session)
         return len(items), store.upsert_news(items)
 
     def _ownership():
-        since = since_override or store.get_last_success("ownership")
-        items = ingest_ownership.ingest(session=session, since=since)
-        return len(items), store.upsert_ownership(items)
+        return _swept("ownership", ingest_ownership.ingest, store.upsert_ownership)
 
     def _external():
         # Federal contracts / FDA-clinical / patents — slower-moving; pull last 30d, dedupe.
         c = ingest_external.ingest(days=30, session=session)
-        return sum(c.get(k, 0) for k in ("contracts", "fda", "patents")), c.get("new", 0)
+        return sum(c.get(k, 0) for k in ("contracts", "fda", "pdufa", "patents")), c.get("new", 0)
 
     if "edgar" in run:
         _do("edgar", _edgar)
@@ -444,6 +470,47 @@ def publish_log_cmd(no_push: bool = typer.Option(False, "--no-push",
 
 
 @app.command()
+def review() -> None:
+    """Score every past lead in the research log: return since the day it was
+    flagged, vs SPY. The feedback loop for tuning the rubric — not a track record
+    to trade on (few leads, no costs, survivorship)."""
+    from scanner.adapters import price as _price
+    from scanner.http import PoliteSession
+    from scanner.research_log import LOG_PATH, past_leads
+
+    if not LOG_PATH.exists():
+        console.print(f"[yellow]No research log at {LOG_PATH}.[/yellow]")
+        raise typer.Exit(1)
+    leads = past_leads(LOG_PATH.read_text(encoding="utf-8"))
+    if not leads:
+        console.print("[dim]No ranked leads ('#. **TICKER — ...**' lines) in the log yet.[/dim]")
+        return
+    session = PoliteSession()
+    data = {t: _price.fetch_daily(session, t, range_="2y") for t in {t for _, t, _ in leads} | {"SPY"}}
+    table = Table(title="Research-log leads vs SPY (return since the flag date's prior close)",
+                  border_style="cyan")
+    for col in ("Flagged", "Ticker", "Return", "SPY", "Excess", "Entry"):
+        table.add_column(col, justify="right" if col in ("Return", "SPY", "Excess") else "left")
+    excess: list[float] = []
+    for day, t, title in leads:
+        r = _price.reaction((data.get(t) or {}).get("closes", {}), day)
+        s = _price.reaction((data.get("SPY") or {}).get("closes", {}), day)
+        if not (r and s):
+            table.add_row(day, t, "—", "—", "—", _short(title, 50))
+            continue
+        x = r["pct_since_event"] - s["pct_since_event"]
+        excess.append(x)
+        colour = "green" if x > 0 else "red"
+        table.add_row(day, t, f"{r['pct_since_event']:+.1f}%", f"{s['pct_since_event']:+.1f}%",
+                      f"[{colour}]{x:+.1f}%[/{colour}]", _short(title, 50))
+    console.print(table)
+    if excess:
+        console.print(f"[bold]{len(excess)} scored leads:[/bold] beat SPY {sum(x > 0 for x in excess)}/"
+                      f"{len(excess)}, mean excess {sum(excess) / len(excess):+.1f}%  "
+                      "[dim](small sample — a calibration aid, not a track record)[/dim]")
+
+
+@app.command()
 def digest(hours: int = _HOURS_OPT, days: int = _DAYS_OPT) -> None:
     """Build the context pack and save a dated markdown digest to digests/.
 
@@ -472,8 +539,8 @@ def schedule(install: bool = typer.Option(False, "--install", help="Actually cre
              remove: bool = typer.Option(False, "--remove", help="Delete the scheduled tasks.")) -> None:
     """Print (or install) the Windows Task Scheduler jobs for background refresh.
 
-    Two jobs: a recurring refresh while the laptop is on, plus an after-US-close
-    catch-up. Times are LOCAL (IST); the evening job maps to ~4:30pm ET.
+    Two jobs: a recurring refresh while the laptop is on, plus a late-night-ET
+    catch-up. Times are LOCAL (IST); see settings.yaml `schedule` for the mapping.
     """
     import subprocess
 

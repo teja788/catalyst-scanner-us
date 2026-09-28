@@ -89,6 +89,6 @@ chosen exchanges); drop it to e.g. **500** for faster iteration — no code chan
 | 9 | `CLAUDE.md` rubric + live end-to-end `scan` | ✅ done — **usable end-to-end** |
 | 10 | `ask` + `digest` | ✅ done (stored query + targeted `--fetch`; dated digests) |
 | 11 | Windows scheduler (ET-aware) | ✅ done (45-min + after-close catch-up; IST↔ET documented) |
-| 12 | Phase-2 stubs (FDA, contracts, patents, short interest, FRED, LLM scorer, price adapter, watchlist, notify) | ✅ done (clearly-marked TODOs, off by default) |
+| 12 | External feeds (FDA, contracts, patents), price adapter, watchlist, dashboard AI panels | ✅ done (unbuilt stubs — short interest, FRED, notify — removed 2026-09) |
 
 After Milestone 9 the tool is usable end-to-end; 10–12 are enhancements.

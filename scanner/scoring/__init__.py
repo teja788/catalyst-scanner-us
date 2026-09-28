@@ -1,5 +1,5 @@
-"""Scoring package. Default mode is 'agent' (live, in-session reasoning).
+"""Scoring package. The ranking is done live by the in-session agent (CLAUDE.md).
 
-The optional 'llm_api' mode (scoring/llm_scorer.py) is a clearly-marked, OFF-by-
-default hook — no API key is required for the tool to function.
+llm_scorer / claude_code back the dashboard's optional AI rank + chat panels only;
+no API key is required for the tool to function.
 """

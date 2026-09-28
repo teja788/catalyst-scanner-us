@@ -15,11 +15,12 @@ Run via `run.bat <command>` (Windows) or `.venv\Scripts\python.exe -m scanner.cl
 
 | Command | What it does |
 |---|---|
-| `setup-universe` | (Re)build the top-N US-by-market-cap universe + ticker→CIK map. Run occasionally. |
+| `setup-universe` | (Re)build the top-N US-by-market-cap universe + ticker→CIK map + annual revenues (materiality). Run monthly. |
 | `refresh` | Run all ingesters (EDGAR + news + ownership), catch-up since last run, store with dedupe. |
 | `scan` | `refresh` → pre-filter → write `runtime/context_pack.md`. Add `--skip-refresh` to use stored data. |
 | `ask "<question>"` | Print stored data relevant to a company / tag for a follow-up (`--fetch` for a fresh pull). |
 | `digest` | Save a dated ranked digest to `digests/`. |
+| `review` | Score past research-log leads: return since flagged vs SPY (rubric feedback loop). |
 | `watch add/remove/list <TICKER>` | Manage the watchlist — watched tickers float to a ★ section at the very top of the pack. |
 | `schedule` | Print/install the Windows Task Scheduler jobs (ET-aware). |
 
@@ -39,9 +40,13 @@ opportunities**. The pack separates SEC FILINGS (highest trust) from OWNERSHIP
 (disclosed 13D/13G/Form 4), WIRE/PR, and NEWS (lower trust) — preserve that
 separation and never blur it.
 
-**Check the `Data freshness:` header line first** — if a source is marked STALE
-(>48h since its last successful refresh), say so explicitly instead of calling it a
-quiet day; an empty section then means "not fetched", not "nothing happened".
+**Check the `Data freshness:` header line first** — if a source is marked
+STALE/FAILED (last run failed, or no run in >48h), say so explicitly instead of
+calling it a quiet day; an empty section then means "not fetched", not "nothing
+happened". For edgar/ownership it also shows **`index through <day>`**: the last
+filing day covered by SEC's nightly daily index. Filings after that day come from
+EDGAR's live feed (best-effort, may be partial) until that night's index lands —
+say so when a scan is run during the US trading day.
 Also check the **`⚠ BODY COVERAGE INCOMPLETE` header line** (appears on wide
 windows): it means N candidate filings were not body-read this pass, so the
 CATALYST bucket may be missing items — mention it, and suggest re-running `scan`
@@ -52,8 +57,10 @@ deterministically surfaces the highest-signal items — superinvestor/watchlist 
 activist stakes, insider buys, completed M&A / distress / control-change 8-Ks,
 **business CATALYSTS read from filing bodies** (lucrative contracts, capacity
 expansions, FDA/clinical, partnerships, patents — financing/comp filtered out), and
-**EXTERNAL feeds** (federal contract awards via USAspending, FDA drug approvals +
-ClinicalTrials Phase-3 readouts, USPTO patents) — and is **never silently truncated**:
+**EXTERNAL feeds** (federal contract awards via USAspending — only awards >= 0.25% of
+the recipient's mcap are shown; FDA drug approvals incl. same-day NOVEL approvals +
+ClinicalTrials Phase-3 readouts; the forward **PDUFA / ADCOMM calendar** from
+pdufa.bio; USPTO patents) — and is **never silently truncated**:
 generous per-bucket caps keep it readable and any overflow appears as an explicit
 "… N more in window" line (the verbose SEC FILINGS list below it is capped for
 readability). This guarantees the top signals are never lost in a large window.
@@ -79,11 +86,24 @@ readability). This guarantees the top signals are never lost in a large window.
   mechanically executed — much weaker than a "discretionary open-market buy". "First
   buy by this insider in stored history" = novelty cue (history depth = the DB's).
   C-suite (CEO/CFO) buys outweigh director buys. Lone buys under ~$25k are floored out
-  of the priority list (they remain in the OWNERSHIP section).
+  of the priority list (they remain in the OWNERSHIP section). **"holding +X% (a → b
+  sh)"** shows how much the insider grew that holding — a 25x increase is a different
+  signal from a 1% top-up. Purchases whose Form-4 footnote says private transaction /
+  estate planning / IPO / placement are **`BUY-PRIVATE`** and are NOT in the buy
+  buckets (seen live: a "$30M buy" that was a director-to-director estate transfer).
+  A **`⚠ Form-4 price … vs market close`** line means the reported price is not the
+  US market price (foreign currency, plan or placement) — the $ totals are unreliable.
+- **`[SUPERINVESTOR 13F: …]` lines** are position changes (NEW / ADD / CUT / EXIT, >= 50%
+  share change, >= $5M position) vs that manager's previous 13F-HR. They are
+  QUARTERLY and ~45 days lagged — a thesis cue, never a timing signal.
 - **`px … % since event` lines are the priced-in check**: a big move since the event
   means the market has already re-rated it — down-rank; a flat price on a strong
-  catalyst is the asymmetric setup. Absence of the line just means no quote data.
-- The CATALYST bucket is **pre-sorted by materiality-to-size** (body $ / mcap), not
+  catalyst is the asymmetric setup. The **`last session +X% on Nx avg volume`** part
+  shows whether it is moving on it NOW (e.g. +171% on 31x = fully re-rated). The
+  news COVERAGE count is a weak attention proxy (0 for most names); prefer the price
+  and volume reaction. Absence of the line just means no quote data.
+- The CATALYST bucket is **pre-sorted by materiality-to-size** (event $ / annual
+  revenue when known, else / mcap; periodic 10-K/10-Q/20-F reports are excluded), not
   recency — the top entries are the candidate needle-movers. The `earnings_strength`
   tag (record quarter / beats) is deliberately NOT a lucrative catalyst — backward-
   looking results are not a forward mechanism unless guidance actually changed.
@@ -99,10 +119,12 @@ For each candidate, judge:
 2. **Materiality relative to size** — is this big *for this company*? Use the
    market cap in the pack. A $200M order means more to a $2B company than a $2T one.
    **Prioritise high materiality-to-size.** Enriched filing lines carry a
-   deterministic `≈$N mentioned in body (~X% of mcap)` hint — a strong materiality
-   cue, but it is the LARGEST figure anywhere in the body, which is often a
-   HISTORICAL amount recited as background (8-Ks restate old deal terms), or a
-   financing amount. Before citing a magnitude, read the item's OPENING sentences —
+   deterministic `≈$N in event text (~X% of annual revenue, ~Y% of mcap)` hint — a
+   strong materiality cue. It is the largest figure in the item text after the cover
+   page, with sentences that name an earlier year or say "previously disclosed"
+   removed — but it can still be a financing amount, a cap ("up to"), or a recital
+   that names no year. A **`⚠ implausible (>5x mcap)`** tag marks a figure too big
+   for the company (usually an "up to" cap or aspirational total); those rank last. Before citing a magnitude, read the item's OPENING sentences —
    that's where the NEW event lives — and confirm the figure's DATE belongs to the
    new event, not to a transaction that already closed. (Learned the hard way:
    a "$220M" body mention was an Aug-2025 closing; the actual June-2026 event was
@@ -198,14 +220,14 @@ and offer to fetch it — never fabricate.
 
 ## Architecture (one-liner per layer)
 
-Deterministic Python does plumbing only: `ingest_edgar` (daily-index + 8-K items) /
+Deterministic Python does plumbing only: `ingest_edgar` (daily index + EFTS same-day + SGML headers) /
 `ingest_news` (wires + RSS, company-tagged) / `ingest_ownership` (13D/13G/Form 4,
-superinvestor-matched) / `ingest_external` (USAspending contracts + openFDA/ClinicalTrials
+superinvestor-matched, 13F position diffs) / `ingest_external` (USAspending contracts + openFDA / FDA novel approvals / pdufa.bio / ClinicalTrials
 readouts + PatentsView, universe name-matched) → `store` (SQLite, dedupe, catch-up) →
 `prefilter` (drop noise, tag catalysts) → `filing_body` (reads catalyst 8-K bodies + re-tags,
 so a "material agreement" reveals the actual deal) → `context_pack` (the small packet you
-read). The agent does all the judgement. `scoring/llm_scorer.py` is OFF by default (no API
-key needed). Patents need a free `PATENTSVIEW_API_KEY` env var; without it that feed is skipped.
+read). The agent does all the judgement. `scoring/llm_scorer.py` backs only the dashboard's optional
+AI panels (it reads this rubric from CLAUDE.md). Patents need a free `PATENTSVIEW_API_KEY` env var; without it that feed is skipped.
 
 ## Hard constraints
 

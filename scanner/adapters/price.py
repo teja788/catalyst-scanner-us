@@ -30,43 +30,74 @@ def _et() -> ZoneInfo:
     return ZoneInfo(load_settings().get("timezone", "America/New_York"))
 
 
-def fetch_daily_closes(session: PoliteSession, ticker: str,
-                       range_: str = "3mo") -> dict[str, float]:
-    """{ISO date: close} for the last `range_` of trading days, or {} on failure."""
+def fetch_daily(session: PoliteSession, ticker: str,
+                range_: str = "3mo") -> dict[str, dict[str, float]]:
+    """{"closes": {ISO date: close}, "volumes": {ISO date: volume}} for the last
+    `range_` of trading days, or {} on failure."""
     if not ticker:
         return {}
     try:
-        js = session.get(_CHART_URL.format(ticker=ticker.upper()), timeout=20,
+        # Yahoo spells class shares with '-' (BRK-A, BF-B); Nasdaq Trader uses '.'
+        js = session.get(_CHART_URL.format(ticker=ticker.upper().replace(".", "-")), timeout=20,
                          params={"range": range_, "interval": "1d"},
                          headers={"Accept": "application/json"}).json()
         result = (js.get("chart", {}).get("result") or [{}])[0]
         ts = result.get("timestamp") or []
-        closes = ((result.get("indicators", {}).get("quote") or [{}])[0].get("close")) or []
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
     except Exception as exc:  # noqa: BLE001 - quotes are best-effort garnish
         log.debug("price fetch %s -> %s", ticker, exc)
         return {}
     tz = _et()
-    out: dict[str, float] = {}
-    for t, c in zip(ts, closes):
+    closes: dict[str, float] = {}
+    volumes: dict[str, float] = {}
+    for t, c, v in zip(ts, quote.get("close") or [], quote.get("volume") or []):
         if c is not None:
-            out[datetime.fromtimestamp(t, tz=tz).date().isoformat()] = float(c)
-    return out
+            d = datetime.fromtimestamp(t, tz=tz).date().isoformat()
+            closes[d] = float(c)
+            if v is not None:
+                volumes[d] = float(v)
+    return {"closes": closes, "volumes": volumes} if closes else {}
+
+
+def last_session(data: dict[str, dict[str, float]]) -> dict[str, float] | None:
+    """{"pct": last session's % move, "vol_x": its volume vs the prior-20-session
+    average} — the 'is it moving on this NOW?' check. None when data is short."""
+    closes, vols = data.get("closes") or {}, data.get("volumes") or {}
+    dates = sorted(closes)
+    if len(dates) < 2 or not closes[dates[-2]]:
+        return None
+    prior = [vols[d] for d in dates[-21:-1] if vols.get(d)]
+    avg = sum(prior) / len(prior) if prior else 0
+    return {"pct": round((closes[dates[-1]] / closes[dates[-2]] - 1) * 100, 1),
+            "vol_x": round(vols.get(dates[-1], 0) / avg, 1) if avg else 0.0}
+
+
+def close_on_or_before(closes: dict[str, float], day: str) -> tuple[str, float] | None:
+    """(date, close) of the last close on/before `day` (ISO), or None."""
+    prior = [d for d in sorted(closes) if d <= day[:10]]
+    return (prior[-1], closes[prior[-1]]) if prior else None
 
 
 def reaction(closes: dict[str, float], event_date_iso: str) -> dict[str, Any] | None:
     """Compute {last, last_date, baseline, pct_since_event} for an event date.
 
-    Baseline = last close strictly BEFORE the event date (most catalysts land
-    after-hours, so the event day's own close already reacts). None when the
-    history doesn't reach back to the event or has no data.
+    Baseline = the last close BEFORE the market could react: for an event at or
+    after the 16:00 ET close that is the event day's own close (the reaction is the
+    next session); otherwise (pre-market / intraday / date-only) the close before
+    the event day. None when the history doesn't reach back or has no data.
     """
     if not closes:
         return None
     event = (event_date_iso or "")[:10]
     if not event:
         return None
+    try:
+        after_close = (len(event_date_iso) > 10 and
+                       datetime.fromisoformat(event_date_iso).astimezone(_et()).hour >= 16)
+    except ValueError:
+        after_close = False
     dates = sorted(closes)
-    base_dates = [d for d in dates if d < event]
+    base_dates = [d for d in dates if d <= event] if after_close else [d for d in dates if d < event]
     if not base_dates:
         return None
     baseline = closes[base_dates[-1]]

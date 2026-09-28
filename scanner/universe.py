@@ -9,7 +9,7 @@ Pipeline (Section 4 of the build spec, scaled to top-N across exchanges):
      Requiring a CIK keeps only names that actually file with SEC — the point of
      an EDGAR-driven scanner.
   3. Download market caps from the Nasdaq.com screener (one bulk call per
-     exchange) for RANKING. yfinance is the per-symbol fallback if it bot-blocks.
+     exchange) for RANKING. If any exchange call fails, the rebuild aborts.
   4. Join on a separator-stripped symbol (SEC "BRK-B" / screener "BRK/B" /
      Trader "BRK.B" -> "BRKB"), dedupe by CIK, sort by market cap desc, take N.
   5. Generate a small alias table per company for news tagging (M4).
@@ -227,6 +227,13 @@ def build_map(session: PoliteSession | None = None) -> dict[str, Any]:
     listed = fetch_listed(session)
     cik_map, title_map, cik_raw = fetch_cik_map(session)
     mcaps, mcap_counts = fetch_mcaps(session)
+    # Market caps drive the top-N ranking AND every materiality hint. If any
+    # exchange's screener call failed, its names would rank as $0 and fall out
+    # (or stay with no mcap) — keep the previous good map instead of writing that.
+    bad = [ex for ex, n in mcap_counts.items() if n <= 0]
+    if bad:
+        raise RuntimeError(f"Nasdaq screener returned no market caps for {', '.join(bad)} — "
+                           "universe NOT rebuilt (previous map kept). Retry later.")
 
     (UNIVERSE_DIR / "cik_map_raw.json").write_text(
         json.dumps(cik_raw, ensure_ascii=False), encoding="utf-8")
@@ -295,6 +302,46 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         w.writerow(cols)
         for r in rows:
             w.writerow([r.get(c, "") for c in cols])
+
+
+# Annual revenue (SEC XBRL frames) — the better materiality denominator: a $40M
+# contract is judged against a company's SALES, not its market cap. Tags vary by
+# company, so take the max across the common revenue tags.
+_REVENUE_TAGS = ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+                 "RevenuesNetOfInterestExpense", "SalesRevenueNet")
+REVENUE_PATH = UNIVERSE_DIR / "revenue.json"
+
+
+def fetch_revenues(session: PoliteSession | None = None, year: int | None = None) -> int:
+    """Write {cik10: annual revenue USD} for calendar year `year` (default: last year),
+    filling gaps from the year before. Returns the number of companies covered."""
+    from datetime import date
+
+    session = session or PoliteSession()
+    year = year or date.today().year - 1
+    rev: dict[str, float] = {}
+    for y in (year, year - 1):                       # latest year wins; older fills gaps
+        got: dict[str, float] = {}
+        for tag in _REVENUE_TAGS:
+            url = f"https://data.sec.gov/api/xbrl/frames/us-gaap/{tag}/USD/CY{y}.json"
+            try:
+                rows = session.edgar_get(url, timeout=60).json().get("data") or []
+            except Exception as exc:  # noqa: BLE001 - a missing tag/year is normal
+                log.info("revenue frame %s CY%d -> %s", tag, y, exc)
+                continue
+            for r in rows:
+                k = str(r.get("cik")).zfill(10)
+                got[k] = max(got.get(k, 0.0), float(r.get("val") or 0))
+        for k, v in got.items():
+            rev.setdefault(k, v)
+    REVENUE_PATH.write_text(json.dumps(rev), encoding="utf-8")
+    log.info("Revenue map: %d companies (CY%d, gaps from CY%d)", len(rev), year, year - 1)
+    return len(rev)
+
+
+def load_revenues() -> dict[str, float]:
+    """{cik10: annual revenue} or {} if `setup-universe` hasn't fetched it yet."""
+    return json.loads(REVENUE_PATH.read_text(encoding="utf-8")) if REVENUE_PATH.exists() else {}
 
 
 def load_map() -> list[dict[str, Any]]:

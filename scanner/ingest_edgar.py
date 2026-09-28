@@ -2,31 +2,35 @@
 
 Strategy (Section 5 of the build spec): rather than poll each company, pull the
 EDGAR DAILY INDEX (one file per filing day listing ALL filings), filter it to our
-universe's CIKs + catalyst FORM types, then enrich each match via the per-company
-submissions API — which carries the 8-K item codes, the precise acceptance
-timestamp, and the primary-document name (for a direct, clickable source URL).
+universe's CIKs + catalyst FORM types, then enrich each NEW match from its SGML
+header file ({accession}-index-headers.html) — which carries the 8-K item codes,
+the acceptance timestamp (in ET) and the primary-document name.
 
-This scales to the 5,000-name universe: the daily index costs the same regardless
-of universe size, and the only per-company calls are for CIKs that ACTUALLY filed
-a catalyst form in the window (bounded by activity, not by universe size).
+Why the header and not the submissions API: for fresh filings the submissions
+API's `acceptanceDateTime` is ET mislabelled "Z" (verified live 2026-09: API
+"11:30:40Z" == SGML "113040" ET) and is corrected to true UTC only later, so
+converting it put 8-Ks 4-5h early. The header is ET, always.
 
-Ownership forms (3/4/5, SCHEDULE 13D/13G, 13F-HR) are captured by the ownership
-ingester in M5; this module handles the "company filings" catalyst feed.
+The current day's daily index does not exist until that night (403). For today /
+yesterday EDGAR full-text search (EFTS) stands in (best-effort); those
+days are NOT final, so the catch-up cursor never moves past them.
 
-Verified live (2026-06): daily-index path + row format, unpadded CIKs, literal
-form strings, and that the submissions API exposes 8-K `items`.
+Cost is bounded by activity (one small header per NEW filing), not universe size.
+Ownership forms (3/4/5, SCHEDULE 13D/13G, 13F-HR) are handled by ingest_ownership.
 """
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
+import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
-from dateutil import parser as dtparser
-
+from scanner import store
 from scanner.config import load_settings, load_sources
 from scanner.http import PoliteSession
 from scanner.universe import load_map
@@ -111,15 +115,15 @@ _IDX_CACHE_MAX = 40
 
 
 def fetch_daily_index(session: PoliteSession, d: date) -> list[dict[str, Any]]:
-    """Return parsed rows for one filing day, or [] if no index (weekend/holiday).
+    """Return parsed rows for one filing day, or [] if no index (weekend/holiday/
+    not yet published — the caller decides which via rows_for_day).
 
-    Failure discipline (the silent-data-loss guard): a MISSING index (weekend /
-    holiday) is a 403/404 whose body is S3's "AccessDenied" XML (verified live
-    2026-07 — SEC serves 403, not 404, for absent .idx files). ANY other failure
-    — a fair-access block ("Undeclared Automated Tool" HTML, also a 403), an
-    exhausted 429/5xx retry, a network error — RAISES, so the refresh marks the
-    source failed and the catch-up cursor does NOT advance past a day that was
-    never actually fetched.
+    Failure discipline (the silent-data-loss guard): a MISSING index is a 403/404
+    whose body is S3's "AccessDenied" XML (verified live 2026-07 — SEC serves 403,
+    not 404, for absent .idx files). ANY other failure — a fair-access block
+    ("Undeclared Automated Tool" HTML, also a 403), an exhausted 429/5xx retry, a
+    network error — RAISES, so the refresh marks the source failed and the
+    catch-up cursor does NOT advance past a day that was never actually fetched.
     """
     import requests
 
@@ -141,14 +145,15 @@ def fetch_daily_index(session: PoliteSession, d: date) -> list[dict[str, Any]]:
             except Exception:  # noqa: BLE001 - body only informs classification
                 body = ""
         if code == 404 or (code == 403 and "AccessDenied" in body):
-            rows: list[dict[str, Any]] = []   # genuinely no index = non-trading day
+            rows: list[dict[str, Any]] = []   # no index (yet)
         else:
             # 403 block page / exhausted 429/5xx: NOT a quiet day — fail the run.
             log.warning("daily index %s -> %s (treating as fetch failure, not a holiday)", url, exc)
             raise
     else:
         rows = _parse_idx(text)
-    if d < _now().date():               # never cache today's still-growing index
+    # Never cache today's or yesterday's miss: that index may still be published.
+    if d < _now().date() and (rows or d < _now().date() - timedelta(days=1)):
         if len(_IDX_CACHE) >= _IDX_CACHE_MAX:
             _IDX_CACHE.pop(next(iter(_IDX_CACHE)))   # evict oldest, not everything
         _IDX_CACHE[d] = rows
@@ -175,56 +180,132 @@ def _parse_idx(text: str) -> list[dict[str, Any]]:
     return rows
 
 
-# --------------------------------------------------------------------------- #
-# 2. Submissions API (enrichment): items + acceptance time + primary doc
-# --------------------------------------------------------------------------- #
-def _fetch_submissions(session: PoliteSession, cik10: str) -> dict[str, dict[str, Any]]:
-    """Return {accession_with_dashes: detail} from a company's recent filings."""
-    import requests
+_EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
+# One ROOT form per query (a comma list silently under-returns; each root also
+# returns its /A amendments). Covers FILING_FORMS + the ownership forms + 13F-HR.
+_EFTS_FORMS = ("8-K", "6-K", "10-K", "10-Q", "20-F", "S-1", "424B1", "424B4", "424B5",
+               "DEF 14A", "DEFA14A", "4", "SCHEDULE 13D", "SCHEDULE 13G", "13F-HR")
+_EFTS_TTL_SEC = 600              # EDGAR + ownership ingest reuse one sweep per refresh
+_CUR_CACHE: dict[date, tuple[float, list[dict[str, Any]]]] = {}
 
-    url = (load_sources().get("edgar", {})
-           .get("submissions_api", "https://data.sec.gov/submissions/CIK{cik}.json")
-           ).format(cik=cik10)
-    try:
-        recent = session.edgar_get(url, timeout=45).json().get("filings", {}).get("recent", {})
-    except (requests.HTTPError, ValueError) as exc:
-        log.warning("submissions %s -> %s", cik10, exc)
-        return {}
-    out: dict[str, dict[str, Any]] = {}
-    accs = recent.get("accessionNumber") or []
-    for i, acc in enumerate(accs):
-        # `or` (not a .get default) so a key present-but-null can't blow up
-        out[acc] = {k: (recent.get(k) or [""] * len(accs))[i]
-                    for k in ("items", "acceptanceDateTime", "primaryDocument",
-                              "primaryDocDescription", "reportDate")}
+
+def efts_search(session: PoliteSession, **params: Any) -> list[dict[str, Any]]:
+    """All `_source` hits of an EDGAR full-text-search query (100 per page; the
+    service caps from+size at 10,000). Raises when a page has no `hits` object."""
+    out: list[dict[str, Any]] = []
+    for start in range(0, 10_000, 100):
+        js = session.edgar_get(_EFTS_URL, timeout=30, params={**params, "from": start}).json()
+        if "hits" not in js:
+            raise RuntimeError(f"EFTS error for {params}: {str(js)[:200]}")
+        page = [h["_source"] for h in js["hits"].get("hits", [])]
+        out += page
+        if len(page) < 100:
+            break
     return out
 
 
-# --------------------------------------------------------------------------- #
-# 3. Normalise
-# --------------------------------------------------------------------------- #
-def _to_et_iso(acceptance: str, fallback_date: str) -> str:
-    """SEC acceptanceDateTime is UTC; convert to ET. Fall back to the filed date."""
-    if acceptance:
+def efts_rows(src: dict[str, Any]) -> list[dict[str, Any]]:
+    """One EFTS hit -> daily-index-shaped rows, one per associated CIK (subject AND
+    filer, exactly like the daily index lists them)."""
+    rows = []
+    for name in src.get("display_names") or []:
+        m = re.search(r"^(.*?)\s*(?:\([^)]*\)\s*)*\(CIK (\d{10})\)\s*$", name)
+        if m:
+            rows.append({"cik": int(m.group(2)), "company": m.group(1).strip(), "form": src.get("form", ""),
+                         "date": (src.get("file_date") or "").replace("-", ""), "accession": src.get("adsh", "")})
+    return rows
+
+
+def fetch_current_rows(session: PoliteSession, d: date) -> list[dict[str, Any]]:
+    """Rows filed on `d` from EDGAR full-text search (EFTS) — indexed within minutes,
+    ~0.5-4s per call (the getcurrent Atom feed it replaced took ~8 min per sweep).
+
+    Best-effort: a failing form query is logged and skipped. The nightly index is
+    authoritative and the cursor never passes a day read here.
+    """
+    hit = _CUR_CACHE.get(d)
+    if hit and time.monotonic() - hit[0] < _EFTS_TTL_SEC:
+        return hit[1]
+    day = d.isoformat()
+    rows: dict[tuple[str, int], dict[str, Any]] = {}
+    for form in _EFTS_FORMS:
         try:
-            return dtparser.parse(acceptance).astimezone(_et()).isoformat()
-        except (ValueError, TypeError):
+            hits = efts_search(session, forms=form, dateRange="custom", startdt=day, enddt=day)
+        except Exception as exc:  # noqa: BLE001 - best-effort; the nightly index backfills
+            log.warning("EFTS %s %s -> %s (same-day coverage partial)", form, day, exc)
+            continue
+        for src in hits:                      # hits are per DOCUMENT — dedupe below
+            for r in efts_rows(src):
+                rows[(r["accession"], r["cik"])] = r
+    out = list(rows.values())
+    _CUR_CACHE[d] = (time.monotonic(), out)
+    return out
+
+
+def rows_for_day(session: PoliteSession, d: date) -> tuple[list[dict[str, Any]], bool]:
+    """(rows, final). final=True for a published index or a past non-trading day;
+    final=False for today/yesterday read from EFTS (index not out yet)."""
+    rows = fetch_daily_index(session, d)
+    if rows or d.weekday() >= 5 or d < _now().date() - timedelta(days=1):
+        return rows, True
+    return fetch_current_rows(session, d), False
+
+
+# --------------------------------------------------------------------------- #
+# 2. SGML header (enrichment): items + acceptance time (ET) + primary doc
+# --------------------------------------------------------------------------- #
+def acceptance_iso(text: str, fallback_date: str) -> str:
+    """<ACCEPTANCE-DATETIME>YYYYMMDDHHMMSS (naive ET) from an SGML header, as ISO ET."""
+    m = re.search(r"<ACCEPTANCE-DATETIME>(\d{14})", text)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=_et()).isoformat()
+        except ValueError:
             pass
     try:
         return datetime.strptime(fallback_date, "%Y%m%d").replace(tzinfo=_et()).isoformat()
     except ValueError:
         # Never store a raw non-ISO string: "20260615" sorts AFTER every ISO
-        # timestamp lexicographically, so such a row would appear in EVERY window
-        # forever. An empty filed_at keeps the row queryable by CIK but out of
-        # time-window scans.
+        # timestamp lexicographically, so such a row would appear in EVERY window.
         log.warning("unparseable filing date %r — storing empty filed_at", fallback_date)
         return ""
 
 
-def _item_codes(items_str: str) -> list[str]:
-    return [c.strip() for c in (items_str or "").split(",") if c.strip()]
+def parse_header(text: str) -> dict[str, Any] | None:
+    """Parse an (unescaped) SGML header -> {accepted, items, primary, desc, period}."""
+    if "<ACCEPTANCE-DATETIME>" not in text:
+        return None
+    first_doc = text.split("<DOCUMENT>", 1)[1].split("</DOCUMENT>", 1)[0] if "<DOCUMENT>" in text else ""
+    fn = re.search(r"<FILENAME>([^\s<]+)", first_doc)
+    desc = re.search(r"<DESCRIPTION>([^\n<]*)", first_doc)
+    period = re.search(r"<PERIOD>(\d{8})", text)
+    p = period.group(1) if period else ""
+    return {
+        "accepted": text,
+        "items": re.findall(r"<ITEMS>\s*([\d.]+)", text),
+        "primary": fn.group(1) if fn else "",
+        "desc": desc.group(1).strip() if desc else "",
+        "period": f"{p[:4]}-{p[4:6]}-{p[6:]}" if p else "",
+    }
 
 
+def _fetch_header(session: PoliteSession, cik_int: int, acc: str,
+                  archives_base: str) -> dict[str, Any] | None:
+    """Fetch + parse {acc}-index-headers.html; None on any failure (caller counts it)."""
+    url = f"{archives_base}/{cik_int}/{acc.replace('-', '')}/{acc}-index-headers.html"
+    try:
+        hdr = parse_header(html.unescape(session.edgar_get(url, timeout=30).text))
+    except Exception as exc:  # noqa: BLE001 - counted as a failure by the caller
+        log.warning("filing header %s -> %s", acc, exc)
+        return None
+    if hdr is None:
+        log.warning("filing header %s has no acceptance time", acc)
+    return hdr
+
+
+# --------------------------------------------------------------------------- #
+# 3. Normalise
+# --------------------------------------------------------------------------- #
 def _headline(form: str, codes: list[str], doc_desc: str, company: str) -> str:
     # ASCII-clean separators (no em-dash) so stored headlines stay portable on Windows.
     if form.startswith("8-K") and codes:
@@ -235,15 +316,14 @@ def _headline(form: str, codes: list[str], doc_desc: str, company: str) -> str:
     return f"{form}: {company}"
 
 
-def _normalize(match: dict[str, Any], detail: dict[str, Any], meta: dict[str, Any] | None,
+def _normalize(match: dict[str, Any], hdr: dict[str, Any], meta: dict[str, Any] | None,
                archives_base: str) -> dict[str, Any]:
     cik_int = match["cik"]
     acc = match["accession"]
     accn = acc.replace("-", "")
-    codes = _item_codes(detail.get("items", "")) if match["form"].startswith("8-K") else []
-    primary = detail.get("primaryDocument") or ""
-    if primary:
-        filing_url = f"{archives_base}/{cik_int}/{accn}/{primary}"
+    codes = hdr["items"] if match["form"].startswith("8-K") else []
+    if hdr["primary"]:
+        filing_url = f"{archives_base}/{cik_int}/{accn}/{hdr['primary']}"
     else:
         filing_url = f"{archives_base}/{cik_int}/{accn}/{acc}-index.htm"
     company = (meta or {}).get("name") or match["company"]
@@ -253,15 +333,29 @@ def _normalize(match: dict[str, Any], detail: dict[str, Any], meta: dict[str, An
         "company": company,
         "form_type": match["form"],
         "item_codes": codes,
-        "headline": _headline(match["form"], codes, detail.get("primaryDocDescription", ""), company),
+        "headline": _headline(match["form"], codes, hdr["desc"], company),
         "body_text": "",
         "filing_url": filing_url,
         "accession": acc,
-        "filed_at": _to_et_iso(detail.get("acceptanceDateTime", ""), match["date"]),
-        "report_date": detail.get("reportDate", ""),
+        "filed_at": acceptance_iso(hdr["accepted"], match["date"]),
+        "report_date": hdr["period"],
         "dedupe_hash": _dedupe_hash(acc),
         "source": "SEC EDGAR",
     }
+
+
+def _enrich(session: PoliteSession, matches: list[dict[str, Any]], by_cik: dict[int, dict[str, Any]],
+            archives_base: str) -> tuple[list[dict[str, Any]], int]:
+    """Header-enrich the matches NOT already stored (one fetch each, concurrent under
+    the shared rate gate). Returns (records, failed). A failed header is SKIPPED, never
+    stored bare: INSERT OR IGNORE would freeze a bare row forever."""
+    uniq = {m["accession"]: m for m in matches}           # index lists filer + subject rows
+    known = store.existing_hashes("filings", [_dedupe_hash(a) for a in uniq])
+    todo = [m for a, m in uniq.items() if _dedupe_hash(a) not in known]
+    with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+        hdrs = list(pool.map(lambda m: _fetch_header(session, m["cik"], m["accession"], archives_base), todo))
+    out = [_normalize(m, h, by_cik.get(m["cik"]), archives_base) for m, h in zip(todo, hdrs) if h]
+    return out, len(todo) - len(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -270,12 +364,13 @@ def _normalize(match: dict[str, Any], detail: dict[str, Any], meta: dict[str, An
 def ingest(session: PoliteSession | None = None,
            since: datetime | None = None,
            until: datetime | None = None,
-           forms: set[str] | None = None) -> list[dict[str, Any]]:
-    """Fetch catalyst filings for the universe within [since, until].
+           forms: set[str] | None = None,
+           stats: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Fetch NEW catalyst filings for the universe within [since, until].
 
-    Discovery via the daily index (one call per calendar day in the window);
-    enrichment via the submissions API (one call per CIK that actually filed a
-    catalyst form). Per-day and per-CIK failures are isolated and logged.
+    `stats` (optional) is filled with {"last_index_day": latest day read from a
+    FINAL index (or None), "failed": filings whose header fetch failed}. The
+    caller uses both to decide how far the catch-up cursor may move.
     """
     session = session or PoliteSession()
     forms = forms or FILING_FORMS
@@ -283,42 +378,32 @@ def ingest(session: PoliteSession | None = None,
     since = since or (_now() - timedelta(hours=lookback))
     until = until or _now()
 
-    universe = load_map()
-    by_cik = {int(c["cik"]): c for c in universe}
+    by_cik = {int(c["cik"]): c for c in load_map()}
     archives_base = load_sources().get("edgar", {}).get(
         "archives_base", "https://www.sec.gov/Archives/edgar/data")
 
-    # 1. Discover matched filings from the daily index.
     matches: list[dict[str, Any]] = []
-    days = 0
+    last_final = None
     for d in _iter_dates(since, until):
-        rows = fetch_daily_index(session, d)
-        if rows:
-            days += 1
-        for r in rows:
-            if r["form"] in forms and r["cik"] in by_cik:
-                matches.append(r)
+        rows, final = rows_for_day(session, d)
+        if final and rows:
+            last_final = d
+        matches += [r for r in rows if r["form"] in forms and r["cik"] in by_cik]
 
-    # 2. Enrich per active CIK (one submissions call each, fetched concurrently
-    #    under the shared rate gate), then normalise.
-    unique_ciks = list({m["cik"] for m in matches})
-    subs_cache: dict[int, dict[str, dict[str, Any]]] = {}
-    with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
-        for cik, subs in pool.map(lambda c: (c, _fetch_submissions(session, str(c).zfill(10))), unique_ciks):
-            subs_cache[cik] = subs
-    out = [_normalize(m, subs_cache.get(m["cik"], {}).get(m["accession"], {}),
-                      by_cik.get(m["cik"]), archives_base) for m in matches]
-
-    log.info("EDGAR ingest: %d filings from %d active CIKs over %d index-days [%s..%s]",
-             len(out), len(subs_cache), days, since.date(), until.date())
+    out, failed = _enrich(session, matches, by_cik, archives_base)
+    if stats is not None:
+        stats.update(last_index_day=last_final, failed=failed)
+    log.info("EDGAR ingest: %d new filings (%d header failures), final index through %s [%s..%s]",
+             len(out), failed, last_final, since.date(), until.date())
     return out
 
 
 def fetch_company(session: PoliteSession, cik10: str, since: datetime | None = None,
                   forms: set[str] | None = None) -> list[dict[str, Any]]:
-    """Targeted fresh pull for ONE company via the submissions API (for `ask --fetch`).
+    """Targeted fresh pull for ONE company (for `ask --fetch`).
 
-    Per-company is fine here — it's a single CIK on demand, not the whole universe.
+    The submissions API only DISCOVERS the accessions here; times/items come from
+    the SGML header like the main ingest (see the module docstring for why).
     """
     forms = forms or FILING_FORMS
     meta = {int(c["cik"]): c for c in load_map()}.get(int(cik10))
@@ -332,17 +417,12 @@ def fetch_company(session: PoliteSession, cik10: str, since: datetime | None = N
         return []
     accs = recent.get("accessionNumber", [])
     since_d = since.date().isoformat() if since else None
-    out: list[dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
     for i, acc in enumerate(accs):
         form = (recent.get("form") or [None] * len(accs))[i]
-        if form not in forms:
-            continue
         fdate = (recent.get("filingDate") or [""] * len(accs))[i]
-        if since_d and fdate and fdate < since_d:
-            continue
-        detail = {k: (recent.get(k) or [""] * len(accs))[i]
-                  for k in ("items", "acceptanceDateTime", "primaryDocument", "primaryDocDescription", "reportDate")}
-        match = {"cik": int(cik10), "accession": acc, "form": form,
-                 "date": (fdate or "").replace("-", ""), "company": (meta or {}).get("name", "")}
-        out.append(_normalize(match, detail, meta, archives))
-    return out
+        if form in forms and not (since_d and fdate and fdate < since_d):
+            matches.append({"cik": int(cik10), "accession": acc, "form": form,
+                            "date": (fdate or "").replace("-", ""),
+                            "company": (meta or {}).get("name", "")})
+    return _enrich(session, matches, {int(cik10): meta} if meta else {}, archives)[0]

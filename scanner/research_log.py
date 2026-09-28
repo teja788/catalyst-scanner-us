@@ -8,6 +8,7 @@ duplicated. Used by the dashboard's "Rank with AI" panel.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -22,6 +23,21 @@ def _tz() -> ZoneInfo:
 
 def _hash(text: str) -> str:
     return hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def past_leads(text: str) -> list[tuple[str, str, str]]:
+    """[(entry date, TICKER, entry title)] for every ranked lead in the log — the
+    '#. **TICKER — Company**' lines of the rubric's output format (Watch items are
+    '- **...' bullets and are skipped). Deduped per (date, ticker)."""
+    out: list[tuple[str, str, str]] = []
+    for block in re.split(r"\n## ", text)[1:]:
+        m = re.match(r"(\d{4}-\d{2}-\d{2})[^\n]*? — ([^\n]*)", block)
+        if not m:
+            continue
+        for t in re.findall(r"^\d+\.\s+\*\*([A-Z][A-Z0-9.\-]{0,9})\s+—", block, re.M):
+            if (m.group(1), t) not in {(d, x) for d, x, _ in out}:
+                out.append((m.group(1), t, m.group(2)))
+    return out
 
 
 def save(content: str, title: str = "Signals", key: str | None = None) -> str:
