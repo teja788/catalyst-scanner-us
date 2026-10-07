@@ -52,6 +52,17 @@ keywords:
     - selected to provide
     - task order
     - delivery order
+    # Government/customer contract terms (ROC DOJ 8-K missed 2026-09). Checked vs 7.3k
+    # cached bodies: zero financing/comp hits. Too broad, deliberately NOT here:
+    # "department of war" / "with the u.s. department" (equity deals, LOIs, CFIUS),
+    # "contract value of" (exec-comp vesting targets).
+    - firm fixed price
+    - firm-fixed-price
+    - option periods
+    - contract for commercial products
+    - total contract value
+    - contract ceiling
+    - order valued
   m_and_a:
     - to acquire
     - acquires
