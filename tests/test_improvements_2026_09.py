@@ -142,3 +142,20 @@ def test_last_session_move_and_volume_ratio():
     closes = {f"2026-09-{d:02d}": 10.0 for d in range(1, 21)} | {"2026-09-21": 12.0}
     vols = {f"2026-09-{d:02d}": 100.0 for d in range(1, 21)} | {"2026-09-21": 3100.0}
     assert last_session({"closes": closes, "volumes": vols}) == {"pct": 20.0, "vol_x": 31.0}
+
+
+def test_government_contract_8k_tags_contract_win_but_financing_does_not():
+    """ROC's DOJ contract 8-K (2026-09-30) matched no contract_win keyword, so it never
+    reached the CATALYST bucket. Financing agreements must still stay out."""
+    from scanner.prefilter import tag_filing
+    roc = ("Item 1.01 Entry into a Material Definitive Agreement. On September 14, 2026, the Company "
+           "entered into a Contract for Commercial Products and Commercial Services with the U.S. "
+           "Department of Justice. The Contract provides for a one-year base period, followed by seven "
+           "one-year option periods ... a base license on a firm fixed price basis.")
+    loan = ("Item 1.01 Entry into a Material Definitive Agreement. On September 14, 2026, the Company "
+            "entered into a Credit Agreement providing a $200 million revolving credit facility and a "
+            "term loan, bearing interest at SOFR plus 2.00%. The Company also entered into an "
+            "Underwriting Agreement granting the underwriters a 30-day option to purchase additional "
+            "shares, and an amended employment agreement with its Chief Executive Officer.")
+    assert "contract_win" in tag_filing("8-K", ["1.01"], "", roc)
+    assert "contract_win" not in tag_filing("8-K", ["1.01"], "", loan)
